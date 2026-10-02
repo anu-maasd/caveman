@@ -146,7 +146,8 @@ jobs:
           node-version: "24.16.0"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          # Current Hermes dependencies are declared only for Python >= 3.14.
+          python-version: ${{ matrix.id == 'hermes' && '3.14' || '3.12' }}
       - id: install
         name: Install current upstream binary
         run: ${{ matrix.install_latest }}
@@ -169,6 +170,13 @@ jobs:
         run: |
           mkdir -p agent-probes
           node agents/probe-installed.mjs --require "${{ matrix.id }}" --allow-newer --json > "agent-probes/${{ matrix.id }}.json"
+      - name: Report probe failure
+        if: ${{ always() && steps.probe.outcome == 'failure' }}
+        env:
+          AGENT_ID: ${{ matrix.id }}
+        run: |
+          echo "::warning::Latest $AGENT_ID probe failed; inspect the probe artifact."
+          echo "Latest $AGENT_ID probe failed; inspect the probe artifact." >> "$GITHUB_STEP_SUMMARY"
       - name: Upload untrusted probe result
         if: ${{ always() && steps.install.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
