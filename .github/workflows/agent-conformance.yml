@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
+    inputs:
+      check_latest:
+        description: Also probe current upstream binaries (without publishing drift issues)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,12 +99,17 @@ jobs:
           python-version: "3.12"
       - name: Install pinned upstream binary
         run: ${{ matrix.install }}
+      - name: Check Hermes dependencies
+        if: matrix.id == 'hermes'
+        run: |
+          python -m pip freeze
+          python -m pip check
       - name: Probe isolated version and help surfaces
         run: node agents/probe-installed.mjs --require "${{ matrix.id }}"
 
   latest-drift-probe:
     name: latest drift / ${{ matrix.id }}
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.check_latest)
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -140,6 +150,18 @@ jobs:
       - id: install
         name: Install current upstream binary
         run: ${{ matrix.install_latest }}
+      - name: Check Hermes dependencies
+        if: matrix.id == 'hermes'
+        run: |
+          python -m pip freeze
+          python -m pip check
+      - name: Report installation failure
+        if: ${{ always() && steps.install.outcome == 'failure' }}
+        env:
+          AGENT_ID: ${{ matrix.id }}
+        run: |
+          echo "::warning::Latest $AGENT_ID installation failed; no probe result was produced."
+          echo "Latest $AGENT_ID installation failed; no probe result was produced. See the install step log." >> "$GITHUB_STEP_SUMMARY"
       - id: probe
         name: Probe latest binary without blocking pinned conformance
         if: ${{ always() && steps.install.outcome == 'success' }}
