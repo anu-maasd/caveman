@@ -306,6 +306,14 @@ jobs:
               def do_POST(self):
                   body = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
                   requests.append({"path":self.path,"body":body})
+                  if body.get("stream"):
+                      self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                      for delta, reason in [({"role":"assistant","content":"HERMES_INTEGRATION_OK"},None),({},"stop")]:
+                          chunk={"id":"chatcmpl-validation","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":delta,"finish_reason":reason}]}
+                          self.wfile.write(("data: "+json.dumps(chunk)+"\n\n").encode())
+                      self.wfile.write(b"data: [DONE]\n\n")
+                      self.wfile.flush()
+                      return
                   self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
                   self.wfile.write(json.dumps({"id":"chatcmpl-validation","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"HERMES_INTEGRATION_OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}).encode())
           server=ThreadingHTTPServer(("127.0.0.1",0), Handler)
