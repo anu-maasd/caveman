@@ -314,7 +314,7 @@ jobs:
           os.environ.update(CAVE_GATEWAY_URL=base, OPENAI_API_KEY="sk-validation-dummy")
           os.environ.pop("CUSTOM_BASE_URL",None)
           try:
-              run=subprocess.run(["node",cli,"wrap","hermes","-q","Reply with HERMES_INTEGRATION_OK","-m","gpt-4o-mini","-t","none"],capture_output=True,text=True,timeout=60,cwd=home)
+              run=subprocess.run(["node",cli,"wrap","hermes","-z","Reply with HERMES_INTEGRATION_OK","-m","gpt-4o-mini","-t","none"],capture_output=True,text=True,timeout=60,cwd=home)
               print("CLI_EXIT",run.returncode,flush=True)
               print("CLI_STDOUT",run.stdout[-6000:],flush=True)
               print("CLI_STDERR",run.stderr[-6000:],flush=True)
