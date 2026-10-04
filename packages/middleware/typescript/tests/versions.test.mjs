@@ -8,7 +8,7 @@ import { runtimeFixture } from './runtime-fixture.mjs';
 import { execFile } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { MIDDLEWARE_VERSION } from '../dist/common.js';
@@ -59,7 +59,8 @@ test('framework peers are optional and unranged (Decision 2); tested releases, m
   assert.deepEqual(inspectFrameworkCompatibility('langchain').frameworks.map(check => check.package), ['langchain', '@langchain/core']);
   assert.deepEqual(inspectFrameworkCompatibility('langchain-core').frameworks.map(check => check.package), ['@langchain/core']);
   assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.128.0'), true, 'released 0.125-0.128 were tested');
-  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.129.0'), false, 'zero-major next minor may break APIs');
+  for (const version of ['0.129.0', '0.130.0', '0.131.0']) assert.equal(frameworkCompatible('@anthropic-ai/sdk', version), true);
+  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.132.0'), false, 'zero-major next minor may break APIs');
   assert.equal(frameworkCompatible('openai', '7.12.0'), false, 'older patch than validated floor');
   assert.throws(() => inspectFrameworkCompatibility('typo'), /Unknown Caveman adapter/);
 });
@@ -105,7 +106,15 @@ test('a missing or unparseable version is never in range', () => {
 test('TS-2: in an npm workspace the version gate reads the copy the adapter uses, whatever the working directory', async t => {
   if (!requirePeers(t, 'ai-sdk') || !requirePeers(t, 'openai')) return;
   const root = await mkdtemp(join(tmpdir(), 'caveman-workspace-')), here = fileURLToPath(new URL('../', import.meta.url));
-  const packageDir = url => { let directory = dirname(fileURLToPath(url)); while (!(directory.endsWith('/ai') || directory.endsWith('/openai'))) directory = dirname(directory); return directory; };
+  const packageDir = url => {
+    let directory = dirname(fileURLToPath(url));
+    while (!['ai', 'openai'].includes(basename(directory))) {
+      const parent = dirname(directory);
+      assert.notEqual(parent, directory, `Could not find framework package for ${url}`);
+      directory = parent;
+    }
+    return directory;
+  };
   const write = async (path, text) => { await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), text); };
   await write('package.json', JSON.stringify({ private: true, workspaces: ['apps/*'] }));
   await write('apps/web/package.json', JSON.stringify({ name: 'web', private: true, type: 'module' }));
@@ -118,9 +127,9 @@ test('TS-2: in an npm workspace the version gate reads the copy the adapter uses
   await mkdir(join(root, 'node_modules/@caveman-ai/middleware'), { recursive: true });
   await cp(join(here, 'dist'), join(root, 'node_modules/@caveman-ai/middleware/dist'), { recursive: true });
   await cp(join(here, 'package.json'), join(root, 'node_modules/@caveman-ai/middleware/package.json'));
-  await symlink(join(here, 'node_modules/@caveman-ai/sdk'), join(root, 'node_modules/@caveman-ai/sdk'));
+  await symlink(join(here, 'node_modules/@caveman-ai/sdk'), join(root, 'node_modules/@caveman-ai/sdk'), 'junction');
   await mkdir(join(root, 'apps/web/node_modules'), { recursive: true });
-  for (const name of ['ai', 'openai']) await symlink(packageDir(import.meta.resolve(name)), join(root, 'apps/web/node_modules', name));
+  for (const name of ['ai', 'openai']) await symlink(packageDir(import.meta.resolve(name)), join(root, 'apps/web/node_modules', name), 'junction');
   await write('apps/web/check.mjs', `
     const warnings = []; console.warn = (...args) => warnings.push(args.join(' '));
     const { default: OpenAI } = await import('openai');
