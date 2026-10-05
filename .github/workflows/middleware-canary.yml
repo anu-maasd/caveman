@@ -43,10 +43,14 @@ jobs:
           # still checks the source; node_modules now holds the latest releases.
           git checkout -- package.json "$GITHUB_WORKSPACE/pnpm-lock.yaml"
       - run: pnpm --filter @caveman-ai/sdk run build
-      - run: pnpm --filter @caveman-ai/middleware test
+      - id: middleware-build
+        run: pnpm --filter @caveman-ai/middleware run build
+      - run: node --test tests/*.test.mjs
+        working-directory: packages/middleware/typescript
         env:
           CAVEMAN_REQUIRE_FRAMEWORKS: "1"
       - run: node packages/middleware/typescript/scripts/check-latest-in-range.mjs
+        if: ${{ !cancelled() && steps.middleware-build.outcome == 'success' }}
 
   # Separate job: code from upstream @latest never runs with issue-write
   # credentials, and there is no checkout to tamper with.
@@ -64,6 +68,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          echo "Nightly middleware canary failed: $RUN_URL" >> "$GITHUB_STEP_SUMMARY"
+          has_issues="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')"
+          if [[ "$has_issues" == "false" ]]; then
+            echo "Issues are disabled; see the linked run for failure details." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           title="middleware-canary: TypeScript adapters fail against latest framework releases"
           body="Nightly canary failed: $RUN_URL"$'\n\n'"The pinned suite in engine-ci is unaffected. Check the run for the framework that moved, then widen the tested range or fix the adapter."
           number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)"
