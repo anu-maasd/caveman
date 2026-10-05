@@ -14,8 +14,11 @@ test('doc link checker never fetches a host that merely starts with docs.caveman
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-links-'));
   const file = path.join(dir, 'x.md');
   fs.writeFileSync(file, 'https://docs.caveman.so.evil.invalid/page\n[a](https://docs.caveman.so@evil.invalid/)\n');
-  const out = spawnSync(process.execPath, [path.join(root, '.github/scripts/check-doc-links.mjs'), path.relative(root, file)], { encoding: 'utf8', timeout: 30_000 });
+  const results = [path.relative(root, file), file].map(input =>
+    spawnSync(process.execPath, [path.join(root, '.github/scripts/check-doc-links.mjs'), input], { encoding: 'utf8', timeout: 30_000 }));
   fs.rmSync(dir, { recursive: true, force: true });
-  assert.strictEqual(out.status, 0, out.stderr);
-  assert.match(out.stdout, /0 docs pages/);
+  for (const out of results) {
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.match(out.stdout, /0 docs pages/);
+  }
 });
