@@ -219,6 +219,31 @@ class TestDefaultTransport(unittest.TestCase):
         self.assertEqual(reason, "deadline")
         self.assertLess(elapsed, deadline_s + 0.1, "the whole exchange is bounded, not each read")
 
+    def test_close_interrupts_a_silent_in_flight_response(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def silent(conn):
+            try:
+                conn.recv(65536)
+                entered.set()
+                release.wait(5)
+            finally:
+                conn.close()
+
+        server = raw_server(silent)
+        self.addCleanup(server.close)
+        self.addCleanup(release.set)
+        runtime = MiddlewareRuntime(endpoint=f"http://127.0.0.1:{server.getsockname()[1]}", deadline_ms=20000)
+        self.addCleanup(runtime.close)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(runtime.preflight()), daemon=True)
+        worker.start()
+        self.assertTrue(entered.wait(2), "the request reached the silent peer")
+        runtime.close()
+        worker.join(1)
+        self.assertFalse(worker.is_alive(), "close must interrupt I/O before the twenty-second deadline")
+        self.assertEqual(results[0].reason, "closed")
+
     def test_trickled_response_phases_are_bounded_by_the_deadline(self):
         # A peer trickling one byte per 150 ms held a 500 ms call for ~63 s: socket timeouts bound single reads only.
         status = b"HTTP/1.1 200 OK\r\n"

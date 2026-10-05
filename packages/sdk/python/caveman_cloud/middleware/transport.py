@@ -217,8 +217,14 @@ class HTTPTransport:
             self._idle.clear()
             self._active.clear()
         for connection in active:
+            connection._caveman_watchdog.cancel()  # release duplicates before closing the Windows handle
             try:  # shutdown wakes a thread blocked in recv; close alone does not on every platform
-                connection.sock and connection.sock.shutdown(socket.SHUT_RDWR)
+                if connection.sock:
+                    _shutdown(connection.sock)
+                    # A pending HTTPResponse owns a makefile reference, so close()
+                    # alone can defer closing the handle. Detach before closing it
+                    # to wake Windows select without leaving an owned stale handle.
+                    socket.close(connection.sock.detach())
             except OSError:
                 pass
         for connection in idle + active:
@@ -268,6 +274,7 @@ class HTTPTransport:
                     stale.append(connection)
                     connection = None
             if connection is not None:
+                connection._caveman_watchdog = watchdog
                 self._active.add(connection)
         for dead in stale:
             dead.close()
@@ -277,6 +284,7 @@ class HTTPTransport:
         connection = self._connect(parts, proxy, deadline, watchdog)
         with self._lock:
             if not self._closed:
+                connection._caveman_watchdog = watchdog
                 self._active.add(connection)
                 return connection, False
         connection.close()
