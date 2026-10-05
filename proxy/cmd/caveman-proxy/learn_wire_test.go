@@ -361,4 +361,3 @@ func TestLearnCapabilitiesAnswersWithoutAStore(t *testing.T) {
 		t.Fatal("capabilities must not create a store")
 	}
 }
-

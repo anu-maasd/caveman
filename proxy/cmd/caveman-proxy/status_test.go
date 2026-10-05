@@ -226,4 +226,3 @@ func TestKeepaliveIsAnsweredBeforeTheTokenGate(t *testing.T) {
 		t.Fatalf("GET keepalive status = %d, beacons = %d, want the gate to answer it", response.Code, beacons)
 	}
 }
-
