@@ -115,22 +115,35 @@ test('B5: unknown transforms are ignored; unknown_capability earns one refresh, 
   } finally { runtime.close(); }
 });
 
-test('B3: the optimize deadline comes from capabilities, and client deadlines feed the breaker', async () => {
+test('B3: the optimize deadline comes from capabilities, and client deadlines feed the breaker', async t => {
   const slow = createMiddlewareRuntime({ fetch: async (url, init) => {
     if (url.endsWith('/capabilities')) return Response.json({ ...caps, limits: { ...caps.limits, deadline_ms: 2000 } });
     await new Promise(resolve => setTimeout(resolve, 250));
     return planFor(init.body);
   } });
-  try { assert.equal((await slow.optimize(input(slow.recovery(r.scope)))).status, 'optimized', 'advertised 2000 ms, not a hard 100 ms'); }
+  try {
+    await slow.ready();
+    assert.equal((await slow.optimize(input(slow.recovery(r.scope)))).status, 'optimized', 'advertised 2000 ms, not a hard 100 ms');
+  }
   finally { slow.close(); }
   let posts = 0;
+  // Hashing can exceed 30 ms on a busy runner before a request is sent. Only
+  // admitted network deadlines feed the breaker: control the clocks here.
+  t.mock.method(performance, 'now', () => 0);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const stalled = createMiddlewareRuntime({ fetch: async (url, init) => {
     if (url.endsWith('/capabilities')) return Response.json({ ...caps, limits: { ...caps.limits, deadline_ms: 30 } });
     posts++;
-    return new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason)));
+    return new Promise((_, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      t.mock.timers.tick(29);
+      assert.equal(init.signal.aborted, false);
+      t.mock.timers.tick(1);
+    });
   } });
   try {
     const binding = stalled.recovery(r.scope);
+    await stalled.ready();
     for (let i = 0; i < 5; i++) assert.equal((await stalled.optimize(input(binding))).reason, 'deadline');
     assert.equal((await stalled.optimize(input(binding))).reason, 'circuit_open');
     assert.equal(posts, 5);

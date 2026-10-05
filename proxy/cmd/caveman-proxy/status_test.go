@@ -125,20 +125,40 @@ func TestRunStatusRequiresThisListenerGeneration(t *testing.T) {
 
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
-	r, w, err := os.Pipe()
+	f, err := os.CreateTemp(t.TempDir(), "stdout")
 	if err != nil {
 		t.Fatal(err)
 	}
 	previous := os.Stdout
-	os.Stdout = w
+	os.Stdout = f
+	defer func() {
+		os.Stdout = previous
+		_ = f.Close()
+	}()
+	// A pipe fills before fn returns when no concurrent reader drains it.
+	// A temporary file captures large JSON output on every platform.
 	fn()
 	os.Stdout = previous
-	_ = w.Close()
-	out, err := io.ReadAll(r)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return string(out)
+}
+
+func TestCaptureStdoutLargeOutput(t *testing.T) {
+	want := strings.Repeat("large JSON output\n", 8192)
+	got := captureStdout(t, func() {
+		if _, err := io.WriteString(os.Stdout, want); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got != want {
+		t.Fatalf("captured %d bytes, want %d", len(got), len(want))
+	}
 }
 
 // The identity header exists so the local CLI can match a run-state file it can

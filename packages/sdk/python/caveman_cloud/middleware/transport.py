@@ -78,6 +78,7 @@ class _Watchdog:
         self.fired = False
         self._lock = threading.Lock()
         self._socks: list = []
+        self._borrowed: list = []
         # ponytail: one timer thread per exchange; a shared deadline heap if exchange rates reach thousands per second.
         self._timer = threading.Timer(min(max(0.0, deadline - time.monotonic()), threading.TIMEOUT_MAX), self._fire)
         self._timer.daemon = True
@@ -90,13 +91,17 @@ class _Watchdog:
             return
         with self._lock:
             self._socks.append(dup)
+            # Windows shutdown on a duplicate does not wake reads on the original.
+            # Keep the original too; only the duplicate is ours to close.
+            self._borrowed.append(sock)
             if self.fired:
+                _shutdown(sock)
                 _shutdown(dup)
 
     def _fire(self) -> None:
         with self._lock:
             self.fired = True
-            for sock in self._socks:
+            for sock in self._borrowed + self._socks:
                 _shutdown(sock)
 
     def cancel(self) -> None:
@@ -105,6 +110,7 @@ class _Watchdog:
             for sock in self._socks:
                 sock.close()
             self._socks.clear()
+            self._borrowed.clear()
 
 
 def _reusable(sock) -> bool:
@@ -211,8 +217,15 @@ class HTTPTransport:
             self._idle.clear()
             self._active.clear()
         for connection in active:
+            connection._caveman_watchdog.cancel()  # release duplicates before closing the Windows handle
             try:  # shutdown wakes a thread blocked in recv; close alone does not on every platform
-                connection.sock and connection.sock.shutdown(socket.SHUT_RDWR)
+                sock = connection.sock
+                if sock:
+                    _shutdown(sock)
+                    # A pending HTTPResponse owns a makefile reference, so close()
+                    # alone can defer closing the handle. Detach before closing it
+                    # to wake Windows select without leaving an owned stale handle.
+                    socket.close(sock.detach())
             except OSError:
                 pass
         for connection in idle + active:
@@ -245,6 +258,8 @@ class HTTPTransport:
         connection.timeout = _left(deadline)
         connection._create_connection = lambda address, *_: _dial(address, deadline, watchdog)
         connection.connect()  # dial + CONNECT tunnel + TLS handshake, bounded together by the watchdog
+        if parts.scheme == "https":
+            watchdog.watch(connection.sock)  # TLS wrapping detached the raw socket watched by _dial.
         return connection
 
     def _checkout(self, key, parts, proxy, deadline, watchdog: _Watchdog, fresh: bool = False):
@@ -260,6 +275,7 @@ class HTTPTransport:
                     stale.append(connection)
                     connection = None
             if connection is not None:
+                connection._caveman_watchdog = watchdog
                 self._active.add(connection)
         for dead in stale:
             dead.close()
@@ -269,6 +285,7 @@ class HTTPTransport:
         connection = self._connect(parts, proxy, deadline, watchdog)
         with self._lock:
             if not self._closed:
+                connection._caveman_watchdog = watchdog
                 self._active.add(connection)
                 return connection, False
         connection.close()

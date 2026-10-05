@@ -30,7 +30,7 @@ async function page(url) {
 }
 
 for (const file of process.argv.slice(2)) {
-  const text = await readFile(join(root, file), "utf8");
+  const text = await readFile(resolve(root, file), "utf8");
   const links = new Set([...text.matchAll(/\]\(([^)\s]+)\)|(https:\/\/docs\.caveman\.so[^\s)"'<>`]*)/g)]
     .map((m) => m[1] ?? m[2]));
   for (const link of links) {

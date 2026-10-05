@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -191,7 +192,9 @@ func TestLearnExportWritesPrivacySafeDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows reports synthesized Unix mode bits; the file/content checks
+	// below still run there, while the POSIX permission contract stays strict.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("digest mode = %v, want 0600", info.Mode().Perm())
 	}
 	raw, _ := os.ReadFile(out.Path)
