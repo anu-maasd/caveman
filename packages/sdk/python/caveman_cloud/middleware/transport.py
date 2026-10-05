@@ -219,12 +219,13 @@ class HTTPTransport:
         for connection in active:
             connection._caveman_watchdog.cancel()  # release duplicates before closing the Windows handle
             try:  # shutdown wakes a thread blocked in recv; close alone does not on every platform
-                if connection.sock:
-                    _shutdown(connection.sock)
+                sock = connection.sock
+                if sock:
+                    _shutdown(sock)
                     # A pending HTTPResponse owns a makefile reference, so close()
                     # alone can defer closing the handle. Detach before closing it
                     # to wake Windows select without leaving an owned stale handle.
-                    socket.close(connection.sock.detach())
+                    socket.close(sock.detach())
             except OSError:
                 pass
         for connection in idle + active:
