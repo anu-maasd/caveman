@@ -154,7 +154,7 @@ jobs:
             ref: "1f8acb340f9c72aec1426248cca54139816a77f5"
           - profile: latest
             python: "3.14"
-            ref: "9d4dfde81721caf8e65f242e55002a35692582ba"
+            ref: "e97923c38acba2066aff9c45e35fe1584a2155b2"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
