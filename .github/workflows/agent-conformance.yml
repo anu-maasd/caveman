@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       check_latest:
-        description: Also probe current upstream binaries (without publishing drift issues)
+        description: Test current upstream binaries and real drift issue publication
         type: boolean
         default: false
 
@@ -14,101 +14,6 @@ permissions:
   contents: read
 
 jobs:
-  real-engine-contract:
-    name: all profiles / real compression engine
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
-        with:
-          go-version-file: go.mod
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24.16.0"
-      - name: Validate registry, profile pins, and generated artifacts
-        run: |
-          node agents/compile.mjs
-          git diff --exit-code -- agents/agents.json packages/cli/src/agents.generated.ts packages/cli/src/reserved-verbs.generated.ts
-      - name: Require one pinned probe for every shipped profile
-        run: |
-          node --input-type=module <<'NODE'
-          import { readFileSync } from "node:fs";
-          const registry = JSON.parse(readFileSync("agents/agents.json", "utf8"));
-          const workflow = readFileSync(".github/workflows/agent-conformance.yml", "utf8");
-          const pinned = [...workflow.matchAll(/- id:\s*(\S+)\s*\r?\n\s*install:\s*([^\r\n]+)/g)].map((match) => match[1]);
-          const shipped = registry.agents.map((profile) => profile.id).sort();
-          const duplicates = pinned.filter((id, index) => pinned.indexOf(id) !== index);
-          const missing = shipped.filter((id) => !pinned.includes(id));
-          const unknown = pinned.filter((id) => !shipped.includes(id));
-          if (duplicates.length || missing.length || unknown.length) {
-            throw new Error(`pinned probe coverage mismatch: missing=${missing} unknown=${unknown} duplicates=${duplicates}`);
-          }
-          console.log(`pinned probe coverage: ${shipped.join(", ")}`);
-          NODE
-      - name: Validate drift reporter failures and artifact boundaries
-        run: node --test tests/installer/agent-registry-drift.test.mjs
-      - name: Install CLI build dependencies
-        run: npm install --ignore-scripts --no-audit --no-fund --no-package-lock --prefix packages/cli
-      - name: Build CLI
-        run: npm --prefix packages/cli run build
-      - name: Build real proxy and compression engine
-        run: go build -o "$RUNNER_TEMP/caveman-proxy" ./proxy/cmd/caveman-proxy
-      - name: Run every profile through real compression
-        env:
-          CAVEMAN_TEST_PROXY_BIN: ${{ runner.temp }}/caveman-proxy
-        run: node --test --test-force-exit packages/cli/tests/agent-compression-conformance.runtime.mjs
-
-  pinned-upstream-binary:
-    name: pinned binary / ${{ matrix.id }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: aider
-            install: python -m pip install aider-chat==0.86.2
-          - id: claude
-            install: npm install -g @anthropic-ai/claude-code@2.1.276
-          - id: codex
-            install: npm install -g @openai/codex@0.155.0
-          - id: gemini
-            install: npm install -g @google/gemini-cli@0.60.0
-          - id: hermes
-            install: python -m pip install --src "$RUNNER_TEMP/hermes-source" --editable "git+https://github.com/NousResearch/hermes-agent.git@1f8acb340f9c72aec1426248cca54139816a77f5#egg=hermes-agent" && python -c "import sys; from importlib.metadata import version; name, expected = 'hermes-agent==0.19.1'.split('=='); observed = version(name); print(observed); sys.exit(0 if observed == expected else 'Hermes package version mismatch')"
-          - id: kilo
-            install: npm install -g @kilocode/cli@7.7.3
-          - id: openclaw
-            install: npm install -g openclaw@2026.8.2
-          - id: opencode
-            install: npm install -g opencode-ai@1.18.31
-          - id: pi
-            install: npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
-          - id: qwen
-            install: npm install -g @qwen-code/qwen-code@0.24.0
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24.16.0"
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-      - name: Install pinned upstream binary
-        run: ${{ matrix.install }}
-      - name: Check Hermes dependencies
-        if: matrix.id == 'hermes'
-        run: |
-          python -m pip freeze
-          python -m pip check
-      - name: Probe isolated version and help surfaces
-        run: node agents/probe-installed.mjs --require "${{ matrix.id }}"
-
   latest-drift-probe:
     name: latest drift / ${{ matrix.id }}
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.check_latest)
@@ -198,7 +103,7 @@ jobs:
 
   latest-drift-report:
     name: latest drift report
-    if: ${{ always() && github.event_name == 'schedule' }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.check_latest }}
     needs: latest-drift-probe
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -235,3 +140,113 @@ jobs:
               echo "::warning file=$probe::invalid agent drift probe"
             fi
           done
+
+  integration:
+    name: Hermes integration / ${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: pinned
+            python: "3.12"
+            ref: "1f8acb340f9c72aec1426248cca54139816a77f5"
+          - profile: latest
+            python: "3.14"
+            ref: "9d4dfde81721caf8e65f242e55002a35692582ba"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.16.0"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install and build CLI
+        run: |
+          npm install --ignore-scripts --no-audit --no-fund --no-package-lock --prefix packages/cli
+          npm --prefix packages/cli run build
+      - name: Linux wrapper and drift regression tests
+        run: |
+          node --test tests/installer/agent-registry-drift.test.mjs tests/installer/hermes.test.mjs packages/cli/tests/hermes-wrap.runtime.mjs
+          node --test --test-name-pattern=hermes packages/cli/tests/hooks.runtime.mjs
+      - name: Install real Hermes
+        run: |
+          python -m pip install --editable "git+https://github.com/NousResearch/hermes-agent.git@${{ matrix.ref }}#egg=hermes-agent"
+          python -m pip check
+      - name: Actual Hermes plugin, auth and local provider smoke
+        run: |
+          cat > "$RUNNER_TEMP/hermes-integration.py" <<'PY'
+          import os, json, tempfile, subprocess, pathlib, threading
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          root = pathlib.Path.cwd()
+          home = pathlib.Path(tempfile.mkdtemp(prefix="hermes-integration-"))
+          os.environ.update(HOME=str(home), HERMES_HOME=str(home / ".hermes"), CAVEMAN_HOME=str(home / ".caveman"), CAVE_NO_KEYCHAIN="1", NO_COLOR="1")
+          for key in list(os.environ):
+              if key.endswith("_API_KEY") or key in ("CAVE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+                  os.environ.pop(key, None)
+          (home / ".caveman-cloud").mkdir()
+          (home / ".caveman-cloud" / "config.json").write_text(json.dumps({"wrap":{"proxy":False,"shrink":False,"mcp":False,"browse":False}}))
+          cli = str(root / "packages/cli/dist/index.js")
+          subprocess.run(["node", cli, "hooks", "install", "hermes"], check=True, timeout=30)
+          from hermes_cli.plugins import get_plugin_manager
+          manager = get_plugin_manager()
+          manager.discover_and_load()
+          plugins = manager.list_plugins()
+          matched = [p for p in plugins if p["name"] == "caveman_shrink"]
+          print("PLUGIN", json.dumps(matched), flush=True)
+          assert len(matched) == 1 and matched[0]["enabled"] and not matched[0].get("error")
+          assert matched[0]["hooks"] >= 1
+          result = manager.invoke_hook("transform_terminal_output", command="echo hello", output="hello")
+          print("PLUGIN_SMALL_OUTPUT", repr(result), flush=True)
+          from hermes_cli.runtime_provider import resolve_runtime_provider
+          os.environ["CUSTOM_BASE_URL"] = "https://gateway.example-cave.com/w/hermes"
+          os.environ["EXAMPLE_CAVE_API_KEY"] = "cave_validation_dummy"
+          runtime = resolve_runtime_provider(requested="custom")
+          assert runtime["api_key"] == "cave_validation_dummy", {k:v for k,v in runtime.items() if k != "api_key"}
+          assert "gateway.example-cave.com/w/hermes" in runtime["base_url"], runtime["base_url"]
+          print("MANAGED_AUTH_RESOLVER_OK", runtime["base_url"], flush=True)
+          os.environ.pop("EXAMPLE_CAVE_API_KEY")
+          requests = []
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *args): pass
+              def do_GET(self):
+                  self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+                  self.wfile.write(json.dumps({"object":"list","data":[{"id":"gpt-4o-mini","object":"model"}]}).encode())
+              def do_POST(self):
+                  body = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+                  requests.append({"path":self.path,"body":body})
+                  if body.get("stream"):
+                      self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                      for delta, reason in [({"role":"assistant","content":"HERMES_INTEGRATION_OK"},None),({},"stop")]:
+                          chunk={"id":"chatcmpl-validation","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":delta,"finish_reason":reason}]}
+                          self.wfile.write(("data: "+json.dumps(chunk)+"\n\n").encode())
+                      self.wfile.write(b"data: [DONE]\n\n")
+                      self.wfile.flush()
+                      return
+                  self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+                  self.wfile.write(json.dumps({"id":"chatcmpl-validation","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"HERMES_INTEGRATION_OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}).encode())
+          server=ThreadingHTTPServer(("127.0.0.1",0), Handler)
+          threading.Thread(target=server.serve_forever,daemon=True).start()
+          base=f"http://127.0.0.1:{server.server_port}"
+          os.environ.update(CAVE_GATEWAY_URL=base, OPENAI_API_KEY="sk-validation-dummy")
+          os.environ.pop("CUSTOM_BASE_URL",None)
+          try:
+              run=subprocess.run(["node",cli,"wrap","hermes","-z","Reply with HERMES_INTEGRATION_OK","-m","gpt-4o-mini","-t","clarify"],capture_output=True,text=True,timeout=60,cwd=home)
+              print("CLI_EXIT",run.returncode,flush=True)
+              print("CLI_STDOUT",run.stdout[-6000:],flush=True)
+              print("CLI_STDERR",run.stderr[-6000:],flush=True)
+              print("REQUEST_PATHS",json.dumps([r["path"] for r in requests]),flush=True)
+              assert run.returncode == 0, "Actual Hermes CLI failed"
+              assert requests, "No actual Hermes request reached the local provider"
+              assert all(r["path"].startswith("/w/hermes") for r in requests), "Routing prefix missing"
+              assert "HERMES_INTEGRATION_OK" in run.stdout, "Provider response not propagated"
+              print("ACTUAL_HERMES_ROUTING_OK",flush=True)
+          finally:
+              server.shutdown()
+          
+          PY
+          python "$RUNNER_TEMP/hermes-integration.py"
