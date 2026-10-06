@@ -14,14 +14,20 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
+	"crypto/subtle"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/JuliusBrussee/caveman/proxy/internal/identity"
 	"github.com/JuliusBrussee/caveman/proxy/providers"
 	"github.com/JuliusBrussee/caveman/shared/platform/cacheguard"
 	"github.com/JuliusBrussee/caveman/shared/platform/env"
@@ -51,7 +57,9 @@ type RequestContext struct {
 
 // Authenticator accepts or rejects an inbound request and returns its context.
 // Standalone returns a static single-operator context; a connected build would
-// consult its key cache.
+// consult its key cache. One that refuses every request (the listener serves
+// only the middleware) should also implement RefusesAll() bool returning true,
+// so /health/ready fails when the middleware store does.
 type Authenticator interface {
 	Authenticate(ctx context.Context, r *http.Request) (RequestContext, error)
 }
@@ -240,6 +248,7 @@ type RequestRecord struct {
 	OutputTokens             int
 	CachedInputTokens        int
 	CacheCreationInputTokens int
+	CacheCreation1hTokens    int
 	ReasoningTokens          int
 	TotalCostUSD             float64
 	SavingsUSD               float64
@@ -277,6 +286,29 @@ type RequestRecord struct {
 	// row is list-price eligible (nil otherwise — never a guessed price).
 	WouldSaveTokens int
 	WouldSaveUSD    *float64
+	// Request measurements count the complete original and accepted normalized JSON
+	// with the same offline tokenizer. They include recovery markers, injected
+	// tools and repeated cached replacements. They are not provider token counts
+	// or a counterfactual for unobserved agent work outside this request.
+	RequestTokensBefore           int
+	RequestTokensAfter            int
+	RequestTokenBasis             string
+	RequestMeasurementStatus      string
+	RequestEstimatedInputDeltaUSD *float64
+	RequestSavingsBasis           string
+	// Price snapshots are the exact catalog model and effective observed tier at
+	// request time. Subscription/OAuth uses these only as API equivalents; these
+	// fields never turn subscription traffic into actual billed dollars.
+	PricingProvider             string
+	PricingModel                string
+	PricingCatalogVersion       string
+	PricingKnown                bool
+	PriceInputPerMillion        float64
+	PriceOutputPerMillion       float64
+	PriceCacheReadPerMillion    float64
+	PriceCacheWritePerMillion   float64
+	PriceCacheWrite1hPerMillion float64
+	PriceReasoningPerMillion    float64
 }
 
 // Server is the standalone proxy lifecycle.
@@ -327,12 +359,22 @@ type Server struct {
 	// the freeze registry every lever consults through LeverAllowed. Sessions are
 	// identified by the caller's x-cave-session value; a request without one gets
 	// no entry and the whole mechanism is inert for it.
-	ledger           *sessionLedger
-	httpClient       *http.Client
+	ledger     *sessionLedger
+	httpClient *http.Client
+	// upstreamProxy mirrors the upstream transport's Proxy selector, published to
+	// adapters through the request context (see providers.WithUpstreamProxy).
+	upstreamProxy    func(*http.Request) (*url.URL, error)
 	sessionMarkerKey []byte
 	sessionFallback  func(time.Time, string, string) (string, string)
+	middleware       http.Handler
+	metricsToken     string
 	logger           *slog.Logger
 	inflight         atomic.Int64
+	// unauthorized counts inbound requests the authenticator rejected. A token
+	// gate that is being probed has to be visible to the operator: without a
+	// counter (and the Warn beside it) a brute-force attempt against
+	// CAVEMAN_AUTH_TOKEN is indistinguishable from an idle proxy.
+	unauthorized atomic.Int64
 	// capture is the local body-capture instrument (see capture.go). It is nil
 	// unless CAVE_CAPTURE_DIR names a writable directory, and it never affects
 	// what is sent, recorded, or claimed.
@@ -400,9 +442,14 @@ func (s *Server) prefixStabilized(adapter providers.Adapter) bool {
 }
 
 // Config injects the three seams plus the upstream HTTP client. A nil HTTPClient
-// defaults to a plain client with the standard upstream timeout; the standalone
+// defaults to a plain client with no total request deadline; the standalone
 // binary passes an SSRF-guarded client (see StandaloneHTTPClient).
 type Config struct {
+	// Middleware is the independently authenticated compression-only API. It
+	// never enters provider forwarding or credential resolution. When it also
+	// implements Ready(ctx) and WriteMetrics(w), /health/ready and /metrics
+	// report it.
+	Middleware http.Handler
 	Adapters   []providers.Adapter
 	Auth       Authenticator
 	Creds      CredentialResolver
@@ -445,14 +492,47 @@ type Config struct {
 	// marker correlation; ambiguous cases return empty.
 	SessionFallback func(time.Time, string, string) (string, string)
 	Logger          *slog.Logger
+	// MetricsToken, when set, makes /metrics require `Authorization: Bearer
+	// <token>`. Empty falls back to CAVEMAN_METRICS_TOKEN; unset keeps /metrics
+	// open like the health probes.
+	MetricsToken string
+}
+
+// BoundUpstreamTransport puts the connection-level bounds on an upstream
+// transport. With no total request deadline (CAVE_GATEWAY_UPSTREAM_TIMEOUT_MS
+// defaults to 0) these are the only thing standing between the proxy and an
+// upstream that connects and then never answers. ResponseHeaderTimeout is a
+// first-header deadline, not a body deadline, so a multi-hour SSE stream still
+// runs unbounded; 15 minutes matches the total cap this default replaced and is
+// far beyond any provider's time-to-first-header, streaming or not. Set
+// CAVE_GATEWAY_RESPONSE_HEADER_TIMEOUT_MS=0 to remove it.
+func BoundUpstreamTransport(t *http.Transport) {
+	t.ResponseHeaderTimeout = time.Duration(env.Int("CAVE_GATEWAY_RESPONSE_HEADER_TIMEOUT_MS", 900000)) * time.Millisecond
+	// Explicit rather than inherited: the clone above copies whatever the process
+	// left on http.DefaultTransport, and an idle keep-alive socket to a provider
+	// must not be held open indefinitely.
+	t.IdleConnTimeout = 90 * time.Second
 }
 
 // New constructs a standalone proxy Server.
 func New(cfg Config) *Server {
 	client := cfg.HTTPClient
 	if client == nil {
-		timeout := time.Duration(env.Int("CAVE_GATEWAY_UPSTREAM_TIMEOUT_MS", 900000)) * time.Millisecond
-		client = &http.Client{Timeout: timeout}
+		// Client.Timeout includes the entire response body, including active SSE.
+		// Default to client cancellation; a positive env value is an explicit cap.
+		timeout := time.Duration(env.Int("CAVE_GATEWAY_UPSTREAM_TIMEOUT_MS", 0)) * time.Millisecond
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		BoundUpstreamTransport(transport)
+		client = &http.Client{Timeout: timeout, Transport: transport}
+	}
+	// Adapters that pre-flight their resolved endpoint (bedrock, vertex) need to
+	// know which destinations this client hands to a proxy: on a proxy-only
+	// network the pre-flight's DNS resolve is impossible and the proxy owns
+	// resolution anyway (#1001). Read it off the transport that will carry the
+	// request, so the two can never disagree.
+	var upstreamProxy func(*http.Request) (*url.URL, error)
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		upstreamProxy = transport.Proxy
 	}
 	upstream := cfg.ChatGPTUpstream
 	if upstream == "" {
@@ -489,21 +569,47 @@ func New(cfg Config) *Server {
 		breakpointPlan:       cfg.BreakpointPlan,
 		ledger:               newSessionLedger(),
 		httpClient:           client,
+		upstreamProxy:        upstreamProxy,
 		sessionMarkerKey:     append([]byte(nil), cfg.SessionMarkerKey...),
 		sessionFallback:      cfg.SessionFallback,
+		middleware:           cfg.Middleware,
+		metricsToken:         strings.TrimSpace(cmp.Or(cfg.MetricsToken, env.String("CAVEMAN_METRICS_TOKEN", ""))),
 		logger:               cfg.Logger,
 		capture:              newBodyCapture(os.Getenv("CAVE_CAPTURE_DIR"), cfg.Logger),
 	}
 }
 
 // Handler returns the standalone HTTP handler: health, metrics, and the proxy
-// catch-all. Unlike the managed gateway it serves no SDK/OTLP endpoints — the
-// standalone proxy is a pure base-URL swap.
+// catch-all, plus the separately authenticated framework optimization API.
 func (s *Server) Handler() http.Handler {
+	mux := serveMux(s)
+	if s.upstreamProxy == nil {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(providers.WithUpstreamProxy(r.Context(), s.upstreamProxy)))
+	})
+}
+
+func serveMux(s *Server) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", s.health)
-	mux.HandleFunc("GET /health/ready", s.health)
+	mux.HandleFunc("GET /health/ready", s.ready)
 	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.Handle("/caveman/v1/middleware/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.middleware == nil {
+			w.Header().Set("Retry-After", "1")
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]any{"schema_version": 1, "error": map[string]string{"code": "runtime_unavailable"}})
+			return
+		}
+		// The middleware authenticates for itself, so its 401s would bypass
+		// rejectUnauthorized; count them on the way out instead.
+		recorder := &statusRecorder{ResponseWriter: w}
+		s.middleware.ServeHTTP(recorder, r)
+		if recorder.status == http.StatusUnauthorized {
+			s.noteUnauthorized(r)
+		}
+	}))
 	// ChatGPT-login Codex: OAuth-preserving forward with OpenAI Responses
 	// live-zone compression and exact-original fallback.
 	mux.HandleFunc("/chatgpt/", s.chatgpt)
@@ -521,11 +627,93 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ready is /health/ready. The body reports the middleware ("unavailable" with
+// no runtime, "degraded" when its store cannot take a write), but only a
+// listener that serves nothing else goes unready over it. Provider routes never
+// touch that store, so a Postgres outage must not pull every replica's
+// inference out of the Service at once.
+func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	status, state := http.StatusOK, "unavailable"
+	if s.middleware != nil {
+		state = "ok"
+		if probe, ok := s.middleware.(interface{ Ready(context.Context) error }); ok {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if err := probe.Ready(ctx); err != nil {
+				state = "degraded"
+				if closed, ok := s.auth.(interface{ RefusesAll() bool }); ok && closed.RefusesAll() {
+					status = http.StatusServiceUnavailable
+				}
+				if s.logger != nil {
+					s.logger.Warn("middleware store not writable", "error", err)
+				}
+			}
+		}
+	}
+	httpx.JSON(w, status, map[string]any{
+		"ok":         status == http.StatusOK,
+		"service":    "caveman-proxy",
+		"schema":     "caveman.proxy.health.v1",
+		"billing":    "byok",
+		"adapters":   len(s.adapters),
+		"middleware": state,
+	})
+}
+
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	if s.metricsToken != "" {
+		presented, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(presented)), []byte(s.metricsToken)) != 1 {
+			s.rejectUnauthorized(w, r)
+			return
+		}
+	}
 	w.Header().Set("content-type", "text/plain; version=0.0.4")
-	_, _ = w.Write([]byte("cave_proxy_inflight_requests "))
-	_, _ = w.Write([]byte(itoa(s.inflight.Load())))
-	_, _ = w.Write([]byte("\n"))
+	_, _ = io.WriteString(w, "# HELP cave_proxy_inflight_requests Proxied requests currently in flight.\n"+
+		"# TYPE cave_proxy_inflight_requests gauge\ncave_proxy_inflight_requests "+itoa(s.inflight.Load())+"\n"+
+		"# HELP cave_proxy_unauthorized_total Requests rejected for a missing or wrong credential, middleware and /metrics included.\n"+
+		"# TYPE cave_proxy_unauthorized_total counter\ncave_proxy_unauthorized_total "+itoa(s.unauthorized.Load())+"\n")
+	identity.WriteMetrics(w) // token map and TLS reloads
+	if m, ok := s.middleware.(interface{ WriteMetrics(io.Writer) }); ok {
+		m.WriteMetrics(w)
+	}
+}
+
+// statusRecorder notes the status a wrapped handler wrote. Unwrap keeps
+// http.ResponseController (read deadlines) working through it.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// rejectUnauthorized is the single 401 exit for every handler behind the
+// inbound gate. It counts the rejection and logs it once — the path and the
+// remote HOST, never the presented token, the Authorization header, or the
+// source port. standalone.Auth deliberately returns one uniform error (a
+// missing token must not be distinguishable from a wrong one), so this is the
+// only place the operator learns the gate fired at all.
+func (s *Server) rejectUnauthorized(w http.ResponseWriter, r *http.Request) {
+	s.noteUnauthorized(r)
+	httpx.Error(w, r, http.StatusUnauthorized, "cave_unauthorized", "Request rejected by the proxy authenticator.")
+}
+
+// noteUnauthorized counts and logs one rejection; see rejectUnauthorized.
+func (s *Server) noteUnauthorized(r *http.Request) {
+	s.unauthorized.Add(1)
+	if s.logger != nil {
+		remote := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(remote); err == nil {
+			remote = host
+		}
+		s.logger.Warn("inbound token rejected", "path", r.URL.Path, "remote", remote)
+	}
 }
 
 func itoa(n int64) string {

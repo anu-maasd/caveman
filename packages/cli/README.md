@@ -9,7 +9,7 @@ caveman kilo          # Kilo Code CLI; `caveman kilocode` works too
 caveman qwen          # Qwen Code CLI through a temporary system-settings overlay
 caveman learn         # interactive local Setup Score + grouped top moves
 caveman setup         # show which companion binaries are installed
-caveman stats         # local spend, savings labeled `inferred`
+caveman stats         # local dashboard: tokens, API estimates, subscription equivalents
 ```
 
 `caveman learn` shows animated progress, compact result cards, and a keyboard
@@ -18,6 +18,15 @@ stable compact text, `--all` for every sink and detector id, `--json` for automa
 `caveman learn implement [claude|codex] --prompt "<focus>"` to open an agent
 that reviews fixes one by one. Agent path installs the existing learn guide when
 missing, never edits load-bearing findings, and asks before every edit.
+
+`caveman stats` opens a private, offline dashboard with token history, provider
+and model breakdowns, cache usage, and expandable calculation receipts. Use
+`--days 7` or `--all-time`, filter with `--provider`, `--model`, `--agent` or
+`--auth`, and export with `--json`. `--plain` prints the summary without opening
+a browser. API cost estimates and subscription API equivalents remain separate;
+unknown prices stay unavailable. Earlier segment estimates remain visible
+separately until new requests supply full comparison and pricing evidence.
+See [the accounting method](../../docs/technical/stats-accounting.md).
 
 Claude Code configured for Bedrock has an explicit native Runtime lane:
 
@@ -148,6 +157,26 @@ Contributors may still build from source with
 
 Connected verbs (`login`, `plan`, `score`, `costs`, …) talk to Caveman Cloud
 over HTTP and need no binaries.
+
+For a customer-owned installation, connect to its API origin:
+
+```sh
+caveman login --instance https://caveman.example.com
+```
+
+Approve the displayed code in your instance's browser, choose a project and
+grant its access scopes. This connection creates no inference key and does not
+sync local request history. The CLI's usage telemetry setting remains in effect;
+`caveman telemetry off` disables it. Credentials use the existing secure store;
+`caveman logout` revokes the session. HTTPS is required except for HTTP loopback development.
+Hosted login remains unavailable during beta.
+
+Read agents in the connected project with `caveman cloud agent factory list`
+and `caveman cloud agent factory show <id>`. These commands need
+`trace:read_metadata` access. Factory cases, execution approvals and policy
+remain in the dashboard; the CLI connection cannot grant that authority.
+The existing `cloud agent list|show|run` commands still address optimization
+proposals.
 
 Connected telemetry imports stay under existing `cloud audit` governance verb:
 
