@@ -59,8 +59,8 @@ test('framework peers are optional and unranged (Decision 2); tested releases, m
   assert.deepEqual(inspectFrameworkCompatibility('langchain').frameworks.map(check => check.package), ['langchain', '@langchain/core']);
   assert.deepEqual(inspectFrameworkCompatibility('langchain-core').frameworks.map(check => check.package), ['@langchain/core']);
   assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.128.0'), true, 'released 0.125-0.128 were tested');
-  for (const version of ['0.129.0', '0.130.0', '0.131.0']) assert.equal(frameworkCompatible('@anthropic-ai/sdk', version), true);
-  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.132.0'), false, 'zero-major next minor may break APIs');
+  for (const version of ['0.129.0', '0.130.0', '0.131.0', '0.132.0', '0.132.1']) assert.equal(frameworkCompatible('@anthropic-ai/sdk', version), true);
+  assert.equal(frameworkCompatible('@anthropic-ai/sdk', '0.133.0'), false, 'zero-major next minor may break APIs');
   assert.equal(frameworkCompatible('openai', '7.12.0'), false, 'older patch than validated floor');
   assert.throws(() => inspectFrameworkCompatibility('typo'), /Unknown Caveman adapter/);
 });
