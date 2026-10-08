@@ -8,7 +8,7 @@
 // Usage: node agents/drift-report.mjs --input <probe.json>
 // Requires the `gh` CLI authenticated (GH_TOKEN) with `issues: write`.
 
-import { readFileSync, statSync } from "node:fs";
+import { appendFileSync, readFileSync, statSync } from "node:fs";
 import { cmpVersion } from "./version.mjs";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join } from "node:path";
@@ -19,6 +19,13 @@ const PROBE_SCHEMA = "caveman.agent-probe.v1";
 const MAX_PROBE_BYTES = 1024 * 1024;
 const MAX_RESULTS = 64;
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+function warning(message) {
+  process.stderr.write(`::warning::${message}\n`);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n`);
+  }
+}
 
 function invalid(message) {
   process.stderr.write(`drift-report: invalid probe artifact: ${message}\n`);
@@ -152,7 +159,11 @@ if (!expectedResult || expectedResult.status === "not-installed") {
 // has passed the closed validation above.
 const drifted = expectedResult.status === "drift" ? [expectedResult] : [];
 if (drifted.length === 0) {
-  process.stdout.write("drift-report: no drift observed\n");
+  if (expectedResult.status === "broken" || expectedResult.status === "missing") {
+    warning(`Latest ${expectedId} probe is ${expectedResult.status}; inspect the agent-probe-${expectedId} artifact. No drift issue was published.`);
+  } else {
+    process.stdout.write("drift-report: no drift observed\n");
+  }
   process.exit(0);
 }
 
@@ -191,10 +202,12 @@ for (const r of drifted) {
         (typeof issue.title === "string" && issue.title.startsWith(titlePrefix)) ||
         (typeof issue.body === "string" && issue.body.includes(marker)));
     } catch {
-      existing = undefined;
+      warning(`Drift issue publication failed for ${r.id}: invalid issue list response. See the report log.`);
+      continue;
     }
   } else {
     process.stdout.write(`drift-report: could not list issues for ${r.id}: ${list.stderr}\n`);
+    warning(`Drift issue publication failed for ${r.id}: could not list issues. Check repository Issues settings and token permissions.`);
     continue;
   }
 
@@ -205,9 +218,11 @@ for (const r of drifted) {
     }
     const edit = gh(["issue", "edit", String(existing.number), "--body", body, "--title", title]);
     process.stdout.write(edit.ok ? `drift-report: updated ${r.id} issue #${existing.number}\n` : `drift-report: failed to update ${r.id}: ${edit.stderr}\n`);
+    if (!edit.ok) warning(`Drift issue publication failed for ${r.id}: could not update issue #${existing.number}. See the report log.`);
   } else {
     const created = gh(["issue", "create", "--title", title, "--body", body]);
     process.stdout.write(created.ok ? `drift-report: opened ${r.id} issue\n` : `drift-report: failed to open ${r.id} issue: ${created.stderr}\n`);
+    if (!created.ok) warning(`Drift issue publication failed for ${r.id}: could not create an issue. See the report log.`);
   }
 }
 

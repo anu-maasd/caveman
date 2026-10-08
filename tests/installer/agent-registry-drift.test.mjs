@@ -46,7 +46,7 @@ function resultFor(artifact, id = profile.id) {
   return result;
 }
 
-function runReporter(t, artifact, { expectedId = profile.id, inputBasename = `${expectedId}.json`, includeExpectedId = true, registryOverride } = {}) {
+function runReporter(t, artifact, { expectedId = profile.id, inputBasename = `${expectedId}.json`, includeExpectedId = true, registryOverride, ghScript } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "caveman-drift-report-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   // The reporter reads agents.json from its own directory. A test that needs a
@@ -67,7 +67,7 @@ function runReporter(t, artifact, { expectedId = profile.id, inputBasename = `${
   mkdirSync(bin);
   writeFileSync(input, JSON.stringify(artifact));
   const gh = join(bin, "gh");
-  writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_CALLED_FILE"\nif [ "$1 $2" = "issue list" ]; then printf '[]'; fi\n`);
+  writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_CALLED_FILE"\n${ghScript || 'if [ "$1 $2" = "issue list" ]; then printf \'[]\'; fi'}\n`);
   chmodSync(gh, 0o755);
   const argv = [reporterPath, "--input", input];
   if (includeExpectedId) argv.push("--expected-id", expectedId);
@@ -77,11 +77,13 @@ function runReporter(t, artifact, { expectedId = profile.id, inputBasename = `${
       ...process.env,
       PATH: `${bin}${delimiter}${process.env.PATH || ""}`,
       GH_CALLED_FILE: calls,
+      GITHUB_STEP_SUMMARY: join(dir, "summary"),
     },
   });
   return {
     ...result,
     ghCalls: existsSync(calls) ? readFileSync(calls, "utf8") : "",
+    summary: existsSync(join(dir, "summary")) ? readFileSync(join(dir, "summary"), "utf8") : "",
   };
 }
 
@@ -102,6 +104,39 @@ test("complete matching non-drift artifact performs no gh operation", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /no drift observed/);
   assert.equal(result.ghCalls, "");
+});
+
+test("broken probe warns in the job summary without publishing a drift issue", (t) => {
+  const artifact = validDrift();
+  Object.assign(resultFor(artifact), { status: "broken", help_ok: false, version_error: "", help_error: "ModuleNotFoundError: ruamel" });
+  const result = runReporter(t, artifact);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /::warning::Latest kilo probe is broken/);
+  assert.match(result.summary, /No drift issue was published/);
+  assert.doesNotMatch(result.stdout, /no drift observed/);
+  assert.equal(result.ghCalls, "");
+});
+
+const posixOnly = { skip: process.platform === "win32" && "gh stub is a sh script; the reporter runs on POSIX CI only" };
+for (const operation of ["list", "create", "edit"]) {
+  test(`failed issue ${operation} warns in the job summary`, posixOnly, (t) => {
+    const listResult = operation === "edit" ? '[{"number":1,"title":"agent-drift: kilo old","body":"old"}]' : '[]';
+    const ghScript = `if [ "$1 $2" = "issue ${operation}" ]; then echo 'repository issue operation failed' >&2; exit 1; fi\nif [ "$1 $2" = "issue list" ]; then printf '%s' '${listResult}'; fi`;
+    const result = runReporter(t, validDrift(), { ghScript });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /::warning::Drift issue publication failed for kilo/);
+    assert.match(result.summary, /Drift issue publication failed for kilo/);
+    if (operation === "list") assert.doesNotMatch(result.ghCalls, /issue (create|edit)/);
+  });
+}
+
+test("already-current drift issue is not duplicated", posixOnly, (t) => {
+  const observed = resultFor(validDrift()).observed;
+  const issue = JSON.stringify([{ number: 1, title: "agent-drift: kilo current", body: `installed (@latest): \`${observed}\`` }]);
+  const result = runReporter(t, validDrift(), { ghScript: `if [ "$1 $2" = "issue list" ]; then printf '%s' '${issue}'; fi` });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /issue #1 already current/);
+  assert.doesNotMatch(result.ghCalls, /issue (create|edit)/);
 });
 
 test("release version outranks matching prerelease", { skip: process.platform === "win32" && "gh stub is a sh script; the reporter runs on POSIX CI only" }, (t) => {

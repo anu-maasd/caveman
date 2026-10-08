@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
+    inputs:
+      check_latest:
+        description: Also probe current upstream binaries (without publishing drift issues)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,6 +48,8 @@ jobs:
           }
           console.log(`pinned probe coverage: ${shipped.join(", ")}`);
           NODE
+      - name: Validate drift reporter failures and artifact boundaries
+        run: node --test tests/installer/agent-registry-drift.test.mjs
       - name: Install CLI build dependencies
         run: npm install --ignore-scripts --no-audit --no-fund --no-package-lock --prefix packages/cli
       - name: Build CLI
@@ -94,12 +101,17 @@ jobs:
           python-version: "3.12"
       - name: Install pinned upstream binary
         run: ${{ matrix.install }}
+      - name: Check Hermes dependencies
+        if: matrix.id == 'hermes'
+        run: |
+          python -m pip freeze
+          python -m pip check
       - name: Probe isolated version and help surfaces
         run: node agents/probe-installed.mjs --require "${{ matrix.id }}"
 
   latest-drift-probe:
     name: latest drift / ${{ matrix.id }}
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.check_latest)
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -136,10 +148,31 @@ jobs:
           node-version: "24.16.0"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          # Current Hermes dependencies are declared only for Python >= 3.14.
+          python-version: ${{ matrix.id == 'hermes' && '3.14' || '3.12' }}
       - id: install
         name: Install current upstream binary
         run: ${{ matrix.install_latest }}
+      - id: dependencies
+        name: Check Hermes dependencies
+        if: matrix.id == 'hermes'
+        run: |
+          python -m pip freeze
+          python -m pip check
+      - name: Report dependency failure
+        if: ${{ always() && steps.dependencies.outcome == 'failure' }}
+        env:
+          AGENT_ID: ${{ matrix.id }}
+        run: |
+          echo "::warning::Latest $AGENT_ID dependency check failed; inspect pip check output."
+          echo "Latest $AGENT_ID dependency check failed; inspect pip check output." >> "$GITHUB_STEP_SUMMARY"
+      - name: Report installation failure
+        if: ${{ always() && steps.install.outcome == 'failure' }}
+        env:
+          AGENT_ID: ${{ matrix.id }}
+        run: |
+          echo "::warning::Latest $AGENT_ID installation failed; no probe result was produced."
+          echo "Latest $AGENT_ID installation failed; no probe result was produced. See the install step log." >> "$GITHUB_STEP_SUMMARY"
       - id: probe
         name: Probe latest binary without blocking pinned conformance
         if: ${{ always() && steps.install.outcome == 'success' }}
@@ -147,6 +180,13 @@ jobs:
         run: |
           mkdir -p agent-probes
           node agents/probe-installed.mjs --require "${{ matrix.id }}" --allow-newer --json > "agent-probes/${{ matrix.id }}.json"
+      - name: Report probe failure
+        if: ${{ always() && steps.probe.outcome == 'failure' }}
+        env:
+          AGENT_ID: ${{ matrix.id }}
+        run: |
+          echo "::warning::Latest $AGENT_ID probe failed; inspect the probe artifact."
+          echo "Latest $AGENT_ID probe failed; inspect the probe artifact." >> "$GITHUB_STEP_SUMMARY"
       - name: Upload untrusted probe result
         if: ${{ always() && steps.install.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
