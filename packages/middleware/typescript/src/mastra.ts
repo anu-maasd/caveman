@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { hash } from 'node:crypto';
 import type { ProcessInputStepArgs, ProcessInputStepResult, ProcessLLMRequestArgs, Processor } from '@mastra/core/processors';
 import type { Agent, AgentExecutionOptions } from '@mastra/core/agent';
-import type { LanguageModelV4CallOptions, LanguageModelV4Usage } from '@ai-sdk/provider';
+import type { LanguageModelV4Usage } from '@ai-sdk/provider';
 import { MiddlewareRuntime, type Candidate, type RecoveryBinding, type Scope, type Usage } from '@caveman-ai/sdk/middleware';
 import { MIDDLEWARE_VERSION, bindRecovery, currentOwner, hintRecovery, manifest, nameConflict, observe, observeStream, passiveAttempt as passive, plain,
   recoveryResult, resolveScope, withOwner, type Attempt, type BudgetOptions, type ScopeSource } from './common.js';
@@ -143,6 +143,8 @@ function createProcessor(options: CavemanMastraOptions, enforcedFinalStep: boole
     return { processor: { id: options.id ?? 'caveman', processInputStep(args) { return { model: passiveModel(args.model, options, blocked) }; } }, attest() { return false; } };
   }
   type Model = Extract<ProcessInputStepArgs['model'], { specificationVersion: 'v4' }>;
+  // Mastra vendors its provider types; use the selected model's native contract when upstream AI SDK types drift.
+  type CallOptions = Parameters<Model['doGenerate']>[0];
   interface Step {
     scope: Scope;
     binding: RecoveryBinding | null;
@@ -160,7 +162,7 @@ function createProcessor(options: CavemanMastraOptions, enforcedFinalStep: boole
   const passiveStep = (model: ProcessInputStepArgs['model'], reason: string) => { const wrapped = passiveModel(model, options, reason); passives.add(wrapped); return { model: wrapped }; };
   const calls = new WeakMap<object, string>();
 
-  async function prepare(params: LanguageModelV4CallOptions, model: Model, step: Step): Promise<{ params: LanguageModelV4CallOptions; attempt: Attempt }> {
+  async function prepare(params: CallOptions, model: Model, step: Step): Promise<{ params: CallOptions; attempt: Attempt }> {
     params.abortSignal?.throwIfAborted();
     const attempt: Attempt = { runtime: options.runtime, scope: step.scope, logicalCallId: step.logicalCallId,
       attemptId: crypto.randomUUID(), optimization: null, wireSHA256: null, adapter: 'mastra' };
@@ -238,7 +240,7 @@ function createProcessor(options: CavemanMastraOptions, enforcedFinalStep: boole
       const nativeModel = args.model;
       const model = new Proxy(nativeModel, {
         get(target, key) {
-          if (key === 'doGenerate' || key === 'doStream') return async (params: LanguageModelV4CallOptions) => {
+          if (key === 'doGenerate' || key === 'doStream') return async (params: CallOptions) => {
             params.abortSignal?.throwIfAborted();
             if (currentOwner()) return target[key](params);
             if (!step.outbound) {
