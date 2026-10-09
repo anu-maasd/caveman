@@ -21,6 +21,13 @@ test("macOS/Linux source installer builds every runtime companion", () => {
   }
 });
 
+test("macOS/Linux source installer keeps its shim out of top-level bin/ (#1035)", () => {
+  // Plugin root = repo root, so a checkout added as a local marketplace would
+  // put a top-level bin/ on PATH even though the shim is gitignored.
+  const source = readFileSync(join(root, "scripts", "install-local-cli.sh"), "utf8");
+  assert.doesNotMatch(source, /mkdir -p bin\b|> bin\/|\$PWD\/bin\b/);
+});
+
 test("Windows source installer builds every runtime companion as .exe", () => {
   const source = readFileSync(join(root, "scripts", "install-local-cli.ps1"), "utf8");
   for (const binary of binaries) assert.match(source, new RegExp(`\\\"${binary}\\\"\\s*=`));
@@ -37,6 +44,6 @@ test("native-hook benchmark uses Windows named pipe instead of refusing platform
 
 test("CI takes pnpm version only from packageManager", () => {
   const source = readFileSync(join(root, ".github", "workflows", "engine-ci.yml"), "utf8");
-  assert.match(source, /uses: pnpm\/action-setup@[0-9a-f]{40} # v4\.4\.0/);
+  assert.match(source, /uses: pnpm\/action-setup@[0-9a-f]{40} # v\d+\.\d+\.\d+/);
   assert.doesNotMatch(source, /pnpm\/action-setup@[0-9a-f]{40}[^\n]*\n\s+with:\n\s+version:/);
 });

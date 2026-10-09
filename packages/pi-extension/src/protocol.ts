@@ -1,4 +1,4 @@
-import { verifiedProviderRoute } from "../../cli/src/provider-routing.ts";
+import { verifiedChatGPTSubscriptionRoute, verifiedProviderRoute } from "../../cli/src/provider-routing.ts";
 // Bounded shared types for the Pi ⇄ Caveman native-runtime bridge. Mirrors the
 // caps enforced by the CLI (validNativeRuntimeResponse) and the Go runtime so an
 // oversized field degrades to "absent" instead of crossing the boundary.
@@ -77,10 +77,21 @@ export function outputReplacementOf(response: HookResponse | undefined): string 
   return replacement ? replacement : undefined;
 }
 
+// Match mcp.normalizeRecoveryHandle's historical wrappers, then require one
+// complete CCR id. Never salvage a valid prefix from a malformed reference.
+export function normalizeRecoveryHandle(value: unknown): string | undefined {
+  if (!fits(value, MAX_RECOVERY_REF_BYTES)) return undefined;
+  let handle = value.trim();
+  if (handle.startsWith("<<") && handle.endsWith(">>")) handle = handle.slice(2, -2).trim();
+  if (handle.startsWith("ccr://")) handle = handle.slice(6).trim().replace(/^\/+|\/+$/g, "");
+  else if (handle.startsWith("ccr:")) handle = handle.slice(4).trim();
+  return /^ccr_[A-Za-z0-9_-]+$/.test(handle) ? handle : undefined;
+}
+
 // This route table maps each Pi model API to a path under the local gateway.
 // An API that is not in this table is unsupported, for example azure, bedrock,
-// vertex, mistral, and codex-responses. The extension never routes such an API,
-// because it does not guess a wire protocol.
+// vertex, and mistral. ChatGPT/Codex subscription routing is handled separately
+// and requires proof from the running proxy's published upstream map.
 export const ROUTES_BY_API: Readonly<Record<string, string>> = {
   "anthropic-messages": "/w/pi",
   "openai-completions": "/w/pi/openai/v1",
@@ -91,6 +102,9 @@ export const ROUTES_BY_API: Readonly<Record<string, string>> = {
 // OpenCode Go uses the OpenAI and Anthropic wire protocols, but its upstream is
 // not api.openai.com. This provider mount gives the proxy the correct upstream.
 const ROUTES_BY_PROVIDER_API: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "openai-codex": {
+    "openai-codex-responses": "/w/pi",
+  },
   "opencode-go": {
     "anthropic-messages": "/w/pi/compat/opencode-go",
     "openai-completions": "/w/pi/compat/opencode-go/v1",
@@ -108,6 +122,7 @@ export const UPSTREAM_HOSTS_BY_PROVIDER: Readonly<Record<string, string>> = {
   anthropic: "api.anthropic.com",
   openai: "api.openai.com",
   google: "generativelanguage.googleapis.com",
+  "openai-codex": "chatgpt.com",
   "opencode-go": "opencode.ai",
 };
 
@@ -153,8 +168,9 @@ const COMPAT_SUFFIX_BY_API: Readonly<Record<string, string>> = {
 // upstream maps. Missing proof stays direct, including older proxy state files.
 export function routeForApi(gateway: string, api: string | undefined, provider?: string, originalBaseUrl?: string, compatUpstreams?: Readonly<Record<string, string>>, providerUpstreams?: Readonly<Record<string, string>>): string | undefined {
   if (originalBaseUrl !== undefined) {
-    return verifiedProviderRoute(joinUrl(gateway, "/w/pi"), api, provider ?? "", originalBaseUrl,
-      { compat_upstreams: compatUpstreams, provider_upstreams: providerUpstreams });
+    const published = { compat_upstreams: compatUpstreams, provider_upstreams: providerUpstreams };
+    return verifiedChatGPTSubscriptionRoute(joinUrl(gateway, "/w/pi"), api, provider ?? "", originalBaseUrl, published)
+      ?? verifiedProviderRoute(joinUrl(gateway, "/w/pi"), api, provider ?? "", originalBaseUrl, published);
   }
   // API-only lookup describes routes; it never authorizes a selected model.
   const table = (provider ? ROUTES_BY_PROVIDER_API[provider] : undefined) ?? ROUTES_BY_API;

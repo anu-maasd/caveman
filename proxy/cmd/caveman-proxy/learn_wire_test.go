@@ -25,6 +25,7 @@ func learnWireEnv(t *testing.T) (home, claudeRoot string) {
 	t.Helper()
 	home, claudeRoot = t.TempDir(), t.TempDir()
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
 	t.Setenv("CAVEMAN_HOME", home)
 	t.Setenv("CAVEMAN_DB", filepath.Join(home, "caveman.db"))
 	t.Setenv("CAVEMAN_CLAUDE_ROOT", claudeRoot)

@@ -55,7 +55,7 @@
 
   // ---- live state from storage ----
   let enabled = false;
-  let level = "full";
+  let level = "caveman";
   let bypass = false; // true only during our synchronous button click
   let pending = null;
   let settingsVersion = 0;
@@ -68,11 +68,11 @@
   function refresh() {
     const version = ++settingsVersion;
     cancelPending();
-    chrome.storage.sync.get({ enabled: true, level: "full", sites: {} }, (s) => {
+    chrome.storage.sync.get({ enabled: true, level: "caveman", sites: {} }, (s) => {
       if (version !== settingsVersion) return;
       const siteOn = (s.sites || {})[HOST === "chat.openai.com" ? "chatgpt.com" : HOST] !== false;
       enabled = !!s.enabled && siteOn;
-      level = D.normLevel(s.level);
+      level = D.normMode(s.level);
       renderIndicator();
     });
   }
@@ -231,10 +231,14 @@
       if (getText(el) !== original) return;
     }
     transaction.draft = getText(el);
-    if (!isTextarea(el)) transaction.richDraft = el.innerHTML;
     if (ok && (!transaction.draft.startsWith(prefix) || !transaction.draft.endsWith(original) ||
         !/^\n{2,}$/.test(transaction.draft.slice(prefix.length, -original.length)))) return;
     if (!transaction.draft.trim()) return;
+    // Snapshot the rich draft after the editor's own mutation handling, which
+    // runs as a microtask: ProseMirror redraws the inserted lines there (markup
+    // changes, text does not), and a snapshot taken before it cancelled every
+    // send, leaving the directive in the box and the message unsent.
+    if (!isTextarea(el)) queueMicrotask(() => { transaction.richDraft = el.innerHTML; });
     fireSend(transaction);
   }
 

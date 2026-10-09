@@ -6,11 +6,13 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const assert = require('assert');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const STATS = path.join(ROOT, 'src', 'hooks', 'caveman-stats.js');
 const TRACKER = path.join(ROOT, 'src', 'hooks', 'caveman-mode-tracker.js');
+const SESSION_END_SESSION_ID = 'session-end-stats';
+const INVALID_HOOK_JSON = '{not-json';
 
 let passed = 0;
 let failed = 0;
@@ -167,7 +169,7 @@ test('entries without message.id keep per-line counting (no dedupe key)', (tmp) 
   assert.match(out, /Output tokens:\s+200\b/);
 });
 
-test('full mode reports observed output with savings unknown', (tmp) => {
+test('caveman mode (legacy "full" flag) reports observed output with savings unknown', (tmp) => {
   const sess = makeSession(tmp, [
     { type: 'assistant', message: { usage: { output_tokens: 350 } } },
   ]);
@@ -179,10 +181,10 @@ test('full mode reports observed output with savings unknown', (tmp) => {
   });
   assertSavingsUnknown(out);
   assert.match(out, /Output tokens:\s+350/);
-  assert.match(out, /Mode: full/);
+  assert.match(out, /Mode: caveman\b/);
 });
 
-test('non-full modes also leave savings unknown', (tmp) => {
+test('other modes (legacy "ultra" flag) also leave savings unknown', (tmp) => {
   const sess = makeSession(tmp, [
     { type: 'assistant', message: { usage: { output_tokens: 100 } } },
   ]);
@@ -192,7 +194,7 @@ test('non-full modes also leave savings unknown', (tmp) => {
     encoding: 'utf8',
     env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
   });
-  assert.match(out, /Mode: ultra/);
+  assert.match(out, /Mode: ultracave\b/);
   assertSavingsUnknown(out);
 });
 
@@ -207,6 +209,31 @@ test('reports no-session when no .jsonl exists', (tmp) => {
   } catch (e) { err = e; }
   assert.ok(err, 'should exit non-zero');
   assert.match(err.stderr, /no Claude Code session found/);
+});
+
+// Without --session-file, the current project's transcript beats a newer one
+// from another project. Claude Code's folder name replaces every
+// non-alphanumeric character with '-', so a dot in the path must not defeat it.
+test('manual run prefers the current project transcript over a newer one elsewhere (#563)', (tmp) => {
+  const claudeDir = path.join(tmp, '.claude');
+  const cwd = path.join(tmp, 'my.repo');
+  fs.mkdirSync(cwd, { recursive: true });
+  const slug = fs.realpathSync(cwd).replace(/[^A-Za-z0-9]/g, '-');
+  const write = (dir, name, outputTokens, mtimeSec) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, JSON.stringify({ type: 'assistant', message: { usage: { output_tokens: outputTokens } } }));
+    fs.utimesSync(file, mtimeSec, mtimeSec);
+  };
+  const now = Math.floor(Date.now() / 1000);
+  write(path.join(claudeDir, 'projects', slug), 'a.jsonl', 111, now - 3600);
+  write(path.join(claudeDir, 'projects', '-elsewhere'), 'b.jsonl', 999, now);
+  const out = execFileSync(process.execPath, [STATS, '--host', 'claude'], {
+    encoding: 'utf8', cwd, env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
+  });
+  assert.match(out, /a\.jsonl/);
+  assert.doesNotMatch(out, /b\.jsonl/);
+  assert.match(out, /Output tokens:\s+111/);
 });
 
 test('mode tracker delivers /caveman-stats via additionalContext', (tmp) => {
@@ -332,9 +359,93 @@ test('appends to lifetime history on each run', (tmp) => {
   assert.strictEqual(entry.turns, 1);
   assert.ok(!Object.hasOwn(entry, 'est_saved_tokens'));
   assert.ok(!Object.hasOwn(entry, 'est_saved_usd'));
-  assert.deepStrictEqual(entry.output_tokens_by_mode, { full: 350 });
-  assert.strictEqual(entry.mode, 'full');
+  assert.deepStrictEqual(entry.output_tokens_by_mode, { caveman: 350 });
+  assert.strictEqual(entry.mode, 'caveman');
   assert.strictEqual(entry.model, 'claude-sonnet-4-7');
+});
+
+// SessionEnd runs `caveman-stats.js --record` with the hook payload on stdin.
+function runRecord(claudeDir, input, extraEnv = {}) {
+  return spawnSync(process.execPath, [STATS, '--record'], {
+    encoding: 'utf8',
+    env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, ...extraEnv },
+    input,
+  });
+}
+
+test('--record appends a SessionEnd snapshot silently, with this session\'s own mode', (tmp) => {
+  const sess = makeSession(tmp, [
+    { type: 'assistant', message: { model: 'claude-sonnet-4-7', usage: { output_tokens: 350, cache_read_input_tokens: 40 } } },
+  ]);
+  const claudeDir = path.join(tmp, '.claude');
+  fs.mkdirSync(path.join(claudeDir, '.caveman-sessions'), { recursive: true });
+  fs.writeFileSync(path.join(claudeDir, '.caveman-sessions', `${SESSION_END_SESSION_ID}.mode`), 'ultracave');
+  fs.writeFileSync(path.join(claudeDir, '.caveman-active'), 'caveman'); // another window's last write
+  const r = runRecord(claudeDir, JSON.stringify({ session_id: SESSION_END_SESSION_ID, transcript_path: sess, reason: 'other' }));
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout, '');
+  assert.strictEqual(r.stderr, '');
+
+  const lines = fs.readFileSync(path.join(claudeDir, '.caveman-history.jsonl'), 'utf8').split('\n').filter(Boolean);
+  assert.strictEqual(lines.length, 1);
+  const entry = JSON.parse(lines[0]);
+  assert.strictEqual(entry.session_id, SESSION_END_SESSION_ID);
+  assert.strictEqual(entry.output_tokens, 350);
+  assert.strictEqual(entry.cache_read_input_tokens, 40);
+  assert.strictEqual(entry.turns, 1);
+  assert.strictEqual(entry.mode, 'ultracave');
+  for (const key of Object.keys(entry)) assert.doesNotMatch(key, /saved|savings|usd/i, `no savings field: ${key}`);
+
+  // The lifetime view now counts the session without anyone typing /caveman-stats.
+  const all = execFileSync(process.execPath, [STATS, '--all'], {
+    encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
+  });
+  assert.match(all, /Sessions:\s+1\b/);
+  assert.match(all, /Output tokens:\s+350/);
+});
+
+test('--record ignores malformed hook stdin without guessing a session', (tmp) => {
+  const sess = makeSession(tmp, [
+    { type: 'assistant', message: { model: 'claude-sonnet-4-7', usage: { output_tokens: 350 } } },
+  ]);
+  const claudeDir = path.join(tmp, '.claude');
+  const r = runRecord(claudeDir, INVALID_HOOK_JSON);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout + r.stderr, '');
+  assert.strictEqual(fs.existsSync(path.join(claudeDir, '.caveman-history.jsonl')), false);
+  assert.ok(fs.existsSync(sess), 'fixture session should exist but not be auto-selected');
+});
+
+test('--record never falls back to the newest transcript when the payload names none', (tmp) => {
+  makeSession(tmp, [{ type: 'assistant', message: { usage: { output_tokens: 350 } } }]);
+  const claudeDir = path.join(tmp, '.claude');
+  const r = runRecord(claudeDir, JSON.stringify({ session_id: SESSION_END_SESSION_ID, reason: 'other' }));
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout + r.stderr, '');
+  assert.strictEqual(fs.existsSync(path.join(claudeDir, '.caveman-history.jsonl')), false);
+});
+
+test('--record stays silent with exit 0 on an unreadable or empty transcript', (tmp) => {
+  const claudeDir = path.join(tmp, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const empty = path.join(tmp, 'empty.jsonl');
+  fs.writeFileSync(empty, '');
+  for (const transcript of [path.join(tmp, 'missing.jsonl'), empty]) {
+    const r = runRecord(claudeDir, JSON.stringify({ session_id: SESSION_END_SESSION_ID, transcript_path: transcript }));
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout + r.stderr, '');
+  }
+  assert.strictEqual(fs.existsSync(path.join(claudeDir, '.caveman-history.jsonl')), false);
+});
+
+test('--record runs as a Claude hook even below a Gemini shell', (tmp) => {
+  const sess = makeSession(tmp, [{ type: 'assistant', message: { usage: { output_tokens: 12 } } }]);
+  const claudeDir = path.join(tmp, '.claude');
+  const r = runRecord(claudeDir, JSON.stringify({ session_id: SESSION_END_SESSION_ID, transcript_path: sess }), { GEMINI_CLI: '1' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout, '');
+  const entry = JSON.parse(fs.readFileSync(path.join(claudeDir, '.caveman-history.jsonl'), 'utf8').trim());
+  assert.strictEqual(entry.output_tokens, 12);
 });
 
 test('--all aggregates latest entry per session', (tmp) => {
@@ -400,6 +511,7 @@ test('--all reports empty when no history', (tmp) => {
     env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
   });
   assert.match(out, /No sessions logged yet/);
+  assert.match(out, /recorded when (?:it|they) ends?/);
 });
 
 test('reports original and current memory file bytes without provider-savings claims', (tmp) => {
@@ -543,7 +655,7 @@ test('PowerShell keeps session badges and ignores old savings before stats runs'
   const claudeDir = path.join(tmp, '.claude');
   fs.mkdirSync(claudeDir, { recursive: true });
   fs.writeFileSync(path.join(claudeDir, '.caveman-active'), 'full');
-  seedSessions(claudeDir, { session: 'ultra' });
+  seedSessions(claudeDir, { session: 'ultracave' });
   const suffixPath = path.join(claudeDir, '.caveman-statusline-suffix');
   fs.writeFileSync(suffixPath, '⛏ 1.9k');
   const command = process.platform === 'win32' ? 'powershell' : 'pwsh';
@@ -564,7 +676,7 @@ test('PowerShell keeps session badges and ignores old savings before stats runs'
       }
       throw e;
     }
-    assert.match(out, /\[CAVEMAN:ULTRA\]/);
+    assert.match(out, /\[ULTRACAVE\]/);
     assert.doesNotMatch(out, /⛏|1\.9k/);
   }
   assert.strictEqual(fs.readFileSync(suffixPath, 'utf8'), '⛏ 1.9k');
@@ -597,10 +709,30 @@ test('statusline.sh renders the session mode, not the shared flag', (tmp) => {
   const claudeDir = path.join(tmp, '.claude');
   fs.mkdirSync(claudeDir, { recursive: true });
   fs.writeFileSync(path.join(claudeDir, '.caveman-active'), 'full');
-  seedSessions(claudeDir, { sessA: 'ultra', sessB: 'lite' });
+  seedSessions(claudeDir, { sessA: 'ultracave', sessB: 'megacave' });
 
-  assert.match(statusline(claudeDir, '{"session_id":"sessA"}'), /\[CAVEMAN:ULTRA\]/);
-  assert.match(statusline(claudeDir, '{"session_id":"sessB"}'), /\[CAVEMAN:LITE\]/);
+  assert.match(statusline(claudeDir, '{"session_id":"sessA"}'), /\[ULTRACAVE\]/);
+  assert.match(statusline(claudeDir, '{"session_id":"sessB"}'), /\[MEGACAVE\]/);
+});
+
+test('statusline.sh badge for every mode id and every legacy level name', (tmp) => {
+  if (process.platform === 'win32') return;
+  const claudeDir = path.join(tmp, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const badges = {
+    caveman: '[CAVEMAN]', ultracave: '[ULTRACAVE]', megacave: '[MEGACAVE]',
+    commit: '[CAVEMAN:COMMIT]', review: '[CAVEMAN:REVIEW]', compress: '[CAVEMAN:COMPRESS]',
+    lite: '[CAVEMAN]', full: '[CAVEMAN]', ultra: '[ULTRACAVE]', wenyan: '[MEGACAVE]',
+    'wenyan-lite': '[MEGACAVE]', 'wenyan-full': '[MEGACAVE]', 'wenyan-ultra': '[MEGACAVE]',
+  };
+  for (const [mode, badge] of Object.entries(badges)) {
+    seedSessions(claudeDir, { s: mode });
+    assert.strictEqual(statusline(claudeDir, '{"session_id":"s"}'), '\x1b[38;5;172m' + badge + '\x1b[0m', mode);
+  }
+  for (const mode of ['off', 'manual', 'bogus', '']) {
+    seedSessions(claudeDir, { s: mode });
+    assert.strictEqual(statusline(claudeDir, '{"session_id":"s"}'), '', `${JSON.stringify(mode)} must render nothing`);
+  }
 });
 
 test('statusline.sh renders nothing for a durable off session', (tmp) => {
@@ -621,7 +753,7 @@ test('statusline.sh falls back to the legacy flag without a usable session id', 
   const claudeDir = path.join(tmp, '.claude');
   fs.mkdirSync(claudeDir, { recursive: true });
   fs.writeFileSync(path.join(claudeDir, '.caveman-active'), 'wenyan');
-  seedSessions(claudeDir, { sessA: 'ultra' });
+  seedSessions(claudeDir, { sessA: 'ultracave' });
 
   for (const stdin of [
     '{"session_id":"unknown-session"}',   // valid id, no state file yet
@@ -630,7 +762,7 @@ test('statusline.sh falls back to the legacy flag without a usable session id', 
     'not json at all',
     '',                                   // no payload
   ]) {
-    assert.match(statusline(claudeDir, stdin), /\[CAVEMAN:WENYAN\]/, `stdin: ${stdin}`);
+    assert.match(statusline(claudeDir, stdin), /\[MEGACAVE\]/, `stdin: ${stdin}`);
   }
 });
 
@@ -653,10 +785,10 @@ test('statusline.sh tolerates multiline and whitespace-padded JSON', (tmp) => {
   const claudeDir = path.join(tmp, '.claude');
   fs.mkdirSync(claudeDir, { recursive: true });
   fs.writeFileSync(path.join(claudeDir, '.caveman-active'), 'full');
-  seedSessions(claudeDir, { sessA: 'ultra' });
+  seedSessions(claudeDir, { sessA: 'ultracave' });
 
   const pretty = '{\n  "model": { "id": "x" },\n  "session_id" : "sessA"\n}\n';
-  assert.match(statusline(claudeDir, pretty), /\[CAVEMAN:ULTRA\]/);
+  assert.match(statusline(claudeDir, pretty), /\[ULTRACAVE\]/);
 });
 
 test('appendFlag is symlink-safe (refuses symlinked target)', (tmp) => {
@@ -788,13 +920,14 @@ test('attributes tokens to the mode active when each message happened (#601)', (
   assert.doesNotMatch(out, /1,207/);
   assert.match(out, /Mode changed mid-session/);
   assert.match(out, /caveman off:\s+300 tokens/);
-  assert.match(out, /full:\s+350 tokens/);
+  // A pre-three-skill 'full' log row is attributed to caveman.
+  assert.match(out, /caveman:\s+350 tokens/);
   assertSavingsUnknown(out);
   // Lifetime snapshots preserve the observed mode attribution.
   const hist = fs.readFileSync(path.join(claudeDir, '.caveman-history.jsonl'), 'utf8')
     .split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert.ok(!Object.hasOwn(hist[hist.length - 1], 'est_saved_tokens'));
-  assert.deepStrictEqual(hist[hist.length - 1].output_tokens_by_mode, { none: 300, full: 350 });
+  assert.deepStrictEqual(hist[hist.length - 1].output_tokens_by_mode, { none: 300, caveman: 350 });
 });
 
 test('retains mode attribution after caveman is turned off mid-session (#601)', (tmp) => {
@@ -815,7 +948,7 @@ test('retains mode attribution after caveman is turned off mid-session (#601)', 
     env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
   });
   assert.doesNotMatch(out, /Caveman not active this session/);
-  assert.match(out, /full:\s+350 tokens/);
+  assert.match(out, /caveman:\s+350 tokens/);
   assertSavingsUnknown(out);
 });
 
@@ -841,15 +974,15 @@ test('mixed and unattributed output stays observed usage in reports, shares and 
       assert.match(out, /3 turns, 1,250 output tokens/);
     } else {
       assert.match(out, /Output tokens:\s+1,250/);
-      assert.match(out, /full:\s+1,000 tokens/);
-      assert.match(out, /ultra:\s+200 tokens/);
+      assert.match(out, /caveman:\s+1,000 tokens/);
+      assert.match(out, /ultracave:\s+200 tokens/);
       assert.match(out, /unattributed:\s+50 tokens \(mode unknown\)/);
     }
   }
   const rows = fs.readFileSync(path.join(claudeDir, '.caveman-history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
   for (const row of rows) {
     assert.strictEqual(row.output_tokens, 1250);
-    assert.deepStrictEqual(row.output_tokens_by_mode, { full: 1000, ultra: 200 });
+    assert.deepStrictEqual(row.output_tokens_by_mode, { caveman: 1000, ultracave: 200 });
     assert.strictEqual(row.unattributed_output_tokens, 50);
     assert.strictEqual(row.mode_attribution, 'log');
     assert.ok(!Object.hasOwn(row, 'est_saved_tokens'));
@@ -870,16 +1003,16 @@ test('mode tracker logs timestamped transitions, deduping unchanged modes (#601)
   const rows = () => fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
 
   run('/caveman ultra');
-  run('/caveman ultra'); // unchanged — must not append a duplicate row
+  run('/ultracave'); // same mode under its own command — must not append a duplicate row
   assert.strictEqual(rows().length, 1);
-  assert.strictEqual(rows()[0].mode, 'ultra');
-  assert.strictEqual(rows()[0].prev, 'full');
+  assert.strictEqual(rows()[0].mode, 'ultracave');
+  assert.strictEqual(rows()[0].prev, 'caveman', 'legacy "full" flag logs as caveman');
   assert.ok(Number.isFinite(rows()[0].ts));
 
   run('/caveman off'); // deactivation is a transition too
   assert.strictEqual(rows().length, 2);
   assert.strictEqual(rows()[1].mode, null);
-  assert.strictEqual(rows()[1].prev, 'ultra');
+  assert.strictEqual(rows()[1].prev, 'ultracave');
 });
 
 test('excludes tokens that predate a mid-session flag write with no log (#601)', (tmp) => {
@@ -975,7 +1108,7 @@ test('unattributed output remains counted with unknown mode and savings', (tmp) 
   assert.doesNotMatch(out, /Est\. net:/); // no attributed savings basis → no net claim
 });
 
-test('ultra mode also has no measured net result', (tmp) => {
+test('ultracave mode also has no measured net result', (tmp) => {
   const sess = makeSession(tmp, [
     { type: 'assistant', message: { usage: { output_tokens: 100 } } },
   ]);
@@ -985,7 +1118,7 @@ test('ultra mode also has no measured net result', (tmp) => {
     encoding: 'utf8',
     env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
   });
-  assert.match(out, /Mode: ultra/);
+  assert.match(out, /Mode: ultracave\b/);
   assertSavingsUnknown(out);
   assert.doesNotMatch(out, /Est\. net:/);
 });

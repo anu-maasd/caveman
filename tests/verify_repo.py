@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -25,6 +26,10 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# A headless runner exports CLAUDE_CODE_ENTRYPOINT=sdk-*, which starts
+# SessionStart under the manual policy (#377) and would fail the hook flow.
+os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
 
 class CheckFailure(RuntimeError):
@@ -202,6 +207,8 @@ def verify_skill_frontmatter_upload_compatibility() -> None:
 
     skill_paths = [
         ROOT / "skills/caveman/SKILL.md",
+        ROOT / "skills/ultracave/SKILL.md",
+        ROOT / "skills/megacave/SKILL.md",
         ROOT / "skills/caveman-commit/SKILL.md",
         ROOT / "skills/caveman-help/SKILL.md",
         ROOT / "skills/caveman-review/SKILL.md",
@@ -225,6 +232,8 @@ def verify_synced_files() -> None:
     # of four let the other three drift silently between runs.
     skill_copies = [
         (ROOT / "plugins/caveman/skills/caveman/SKILL.md", skill_source),
+        (ROOT / "plugins/caveman/skills/ultracave/SKILL.md", ROOT / "skills/ultracave/SKILL.md"),
+        (ROOT / "plugins/caveman/skills/megacave/SKILL.md", ROOT / "skills/megacave/SKILL.md"),
         (ROOT / "plugins/caveman/skills/cavecrew/SKILL.md", ROOT / "skills/cavecrew/SKILL.md"),
         (
             ROOT / "plugins/caveman/skills/caveman-compress/SKILL.md",
@@ -268,12 +277,23 @@ def verify_synced_files() -> None:
         )
 
     ensure(
-        (ROOT / "bin" / "install.js").exists(),
-        "bin/install.js missing — package.json bin entry would break npx caveman",
+        (ROOT / "installer" / "install.js").exists(),
+        "installer/install.js missing — package.json bin entry would break npx caveman",
     )
     ensure(
-        (ROOT / "bin" / "lib" / "settings.js").exists(),
-        "bin/lib/settings.js missing — installer would crash on JSONC settings.json",
+        (ROOT / "installer" / "lib" / "settings.js").exists(),
+        "installer/lib/settings.js missing — installer would crash on JSONC settings.json",
+    )
+    # The Claude Code plugin root is the repo root (marketplace.json
+    # "source": "./"), so a tracked top-level bin/ ships inside the plugin:
+    # the CLI puts it on every plugin user's PATH, and claude.ai-hosted
+    # marketplaces reject the plugin outright (#1035). Tracked files only —
+    # gitignored files never reach a marketplace clone, and
+    # scripts/install-local-cli.sh writes its shim to .local-bin/ instead.
+    ensure(
+        not run(["git", "ls-files", "--", "bin"]).stdout.strip(),
+        "top-level bin/ ships inside the Claude plugin (plugin root = repo root) "
+        "and claude.ai-hosted marketplaces reject it; see #1035",
     )
 
     print("Synced copies, caveman.skill zip, and installer entrypoints OK")
@@ -286,12 +306,22 @@ def verify_manifests_and_syntax() -> None:
     manifest_paths = [
         claude_manifest_path,
         ROOT / ".claude-plugin/marketplace.json",
+        ROOT / ".cursor-plugin/plugin.json",
+        ROOT / "hooks/hooks-cursor.json",
         ROOT / ".codex/hooks.json",
         ROOT / "gemini-extension.json",
         ROOT / "plugins/caveman/.codex-plugin/plugin.json",
     ]
     for path in manifest_paths:
         read_json(path)
+
+    # The repo root is also the Claude Code plugin and Gemini extension root;
+    # both auto-load hooks/hooks.json, so one there would double-wire hooks.
+    ensure(
+        not (ROOT / "hooks/hooks.json").exists(),
+        "hooks/hooks.json is auto-loaded by Claude Code and Gemini; "
+        "Cursor's hook lives in hooks/hooks-cursor.json",
+    )
 
     claude_manifest = read_json(claude_manifest_path)
     ensure(isinstance(claude_manifest, dict), "Claude plugin manifest must be an object")
@@ -351,6 +381,7 @@ def verify_manifests_and_syntax() -> None:
         "caveman-statusline.sh",
         "caveman-statusline.ps1",
         "cavecrew-model-overrides.js",
+        "caveman-host-session-start.js",
     }
     manifest: dict[str, str] = {}
     for line in (hook_dir / "checksums.sha256").read_text(encoding="utf-8").splitlines():
@@ -366,8 +397,9 @@ def verify_manifests_and_syntax() -> None:
     run(["node", "--check", "src/hooks/caveman-activate.js"])
     run(["node", "--check", "src/hooks/caveman-mode-tracker.js"])
     run(["node", "--check", "src/hooks/cavecrew-model-overrides.js"])
-    run(["node", "--check", "bin/install.js"])
-    run(["node", "--check", "bin/lib/settings.js"])
+    run(["node", "--check", "src/hooks/caveman-host-session-start.js"])
+    run(["node", "--check", "installer/install.js"])
+    run(["node", "--check", "installer/lib/settings.js"])
     bash = shutil.which("bash")
     if bash is not None:
         run([bash, "-n", "src/hooks/install.sh"])
@@ -398,7 +430,8 @@ def verify_package_contents() -> None:
     ensure(isinstance(payload, list) and len(payload) == 1, "unexpected npm pack manifest")
     files = {entry["path"] for entry in payload[0]["files"]}
     required = {
-        "bin/install.js",
+        "installer/install.js",
+        ".codex/codex-sessionstart.js",  # Codex always-on hook payload (#573)
         "agents/cavecrew-investigator.md",
         "agents/cavecrew-builder.md",
         "agents/cavecrew-reviewer.md",
@@ -494,10 +527,10 @@ def verify_powershell_static() -> None:
 
     # The per-session store must be cleaned up by every uninstall path, or a
     # reinstall inherits stale modes for session ids that no longer exist.
-    installer_text = (ROOT / "bin/install.js").read_text(encoding="utf-8")
+    installer_text = (ROOT / "installer/install.js").read_text(encoding="utf-8")
     uninstall_sh_text = (ROOT / "src/hooks/uninstall.sh").read_text(encoding="utf-8")
     for name, text in (
-        ("bin/install.js", installer_text),
+        ("installer/install.js", installer_text),
         ("src/hooks/uninstall.sh", uninstall_sh_text),
         ("src/hooks/uninstall.ps1", uninstall_text),
     ):
@@ -519,6 +552,111 @@ def load_compress_modules():
     import scripts.validate as validate
 
     return cli, detect, validate
+
+
+def verify_python_text_io_encoding() -> None:
+    section("Python Text IO Encoding")
+
+    # Windows defaults text IO to the ANSI code page (cp1252), so every
+    # `open()` / `read_text()` / `write_text()` that omits `encoding=` reads and
+    # writes in whatever the runner's locale happens to be. That is not a
+    # portability nicety: `packages/sdk/parity/middleware.fixtures.json` carries
+    # UTF-8 emoji, and cp1252 has no mapping for the 0x8d continuation byte at
+    # offset 2105, so `engine-ci`'s windows job died with
+    # `UnicodeDecodeError: 'charmap' codec can't decode byte 0x8d in position
+    # 2105` while merely COLLECTING test_middleware_preflight.py. The failure
+    # only surfaces on main (the windows job is skipped on PRs) and only for
+    # files that happen to hold a byte cp1252 rejects, which is why ASCII-only
+    # flag reads sat here undetected next to it.
+    #
+    # A guard beats fixing the five call sites that bite today: the next fixture
+    # to gain an emoji re-breaks the build the same way, on a job nobody sees
+    # until it is already red.
+    skip_dirs = {
+        "node_modules", ".git", ".venv", "venv", "__pycache__",
+        "build", ".mypy_cache", "target", "dist",
+    }
+    # Routed to other repositories by CLAUDE.md, or a CI-generated mirror of a
+    # source this check already covers — a violation there is not fixable from
+    # this repo, so failing the build on one would only strand the next run.
+    skip_prefixes = (
+        "packages/agent/",
+        "packages/create-caveman-agent/",
+        "browse/",
+        "plugins/",
+    )
+
+    offenders: list[str] = []
+    scanned = 0
+    for path in sorted(ROOT.rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        if any(part in skip_dirs for part in path.relative_to(ROOT).parts):
+            continue
+        if rel.startswith(skip_prefixes):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # A Python source that is not valid UTF-8 is the same defect one
+            # layer down, and skipping it would let the file this check exists
+            # to catch walk straight past the check.
+            offenders.append(f"{rel}: not valid UTF-8")
+            continue
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            # Not this check's job to police syntax, and a real syntax error is
+            # already loud everywhere else.
+            continue
+        scanned += 1
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = None
+            if isinstance(func, ast.Attribute) and func.attr in ("read_text", "write_text"):
+                name = func.attr
+            elif isinstance(func, ast.Name) and func.id == "open":
+                name = "open"
+            elif isinstance(func, ast.Attribute) and func.attr == "open":
+                # `.open(` is overloaded: Path.open() is file IO, but
+                # urllib's `build_opener(...).open(req, timeout=...)` is not,
+                # and neither is os.open (a raw fd, with no encoding to pass).
+                # Path.open's first positional argument is the mode string, so
+                # a first argument that is anything other than a string literal
+                # means this is not a file being opened.
+                if isinstance(func.value, ast.Name) and func.value.id == "os":
+                    continue
+                if node.args and not (
+                    isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    continue
+                name = "open"
+            if name is None:
+                continue
+            if name == "open":
+                mode = ""
+                if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                    mode = str(node.args[1].value)
+                for kw in node.keywords:
+                    if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                        mode = str(kw.value.value)
+                # Binary mode has no encoding to specify.
+                if "b" in mode:
+                    continue
+            if any(kw.arg == "encoding" for kw in node.keywords):
+                continue
+            offenders.append(f"{rel}:{node.lineno} {name}()")
+
+    ensure(
+        not offenders,
+        "text IO without an explicit encoding= (breaks on Windows cp1252): "
+        + ", ".join(offenders),
+    )
+    print(f"{scanned} Python sources checked; all text IO passes an explicit encoding")
 
 
 def verify_compress_fixtures() -> None:
@@ -568,6 +706,12 @@ def verify_hook_install_flow() -> None:
     section("Claude Hook Flow")
 
     ensure(shutil.which("node") is not None, "node is required for hook verification")
+    # Windows installs go through install.ps1. shutil.which("bash") here is often
+    # WSL's System32\bash.exe, which does not share the Windows temp home this
+    # check reads, so install.sh can exit 0 and leave SessionStart absent.
+    if os.name == "nt":
+        print("SKIP: POSIX hook install flow; Windows uses install.ps1")
+        return
     bash = shutil.which("bash")
     if bash is None:
         print("SKIP: Bash hook install flow requires Bash; native PowerShell path covered statically")
@@ -592,7 +736,12 @@ def verify_hook_install_flow() -> None:
         hooks = settings["hooks"]
         ensure(settings["statusLine"]["command"] == "bash /tmp/existing-statusline.sh", "install.sh clobbered existing statusLine")
         ensure("SessionStart" in hooks, "SessionStart hook missing after install")
+        ensure(
+            any("--subagent" in h.get("command", "") for e in hooks.get("SubagentStart", []) for h in e.get("hooks", [])),
+            "SubagentStart hook missing after install",
+        )
         ensure("UserPromptSubmit" in hooks, "UserPromptSubmit hook missing after install")
+        ensure("SessionEnd" in hooks, "SessionEnd hook missing after install")
 
         activate = run(
             ["node", "src/hooks/caveman-activate.js"],
@@ -600,7 +749,7 @@ def verify_hook_install_flow() -> None:
         )
         ensure("CAVEMAN MODE ACTIVE" in activate.stdout, "activation output missing caveman banner")
         ensure("STATUSLINE SETUP NEEDED" not in activate.stdout, "activation should stay quiet when custom statusline exists")
-        ensure((claude_dir / ".caveman-active").read_text(encoding="utf-8") == "full", "activation flag should default to full")
+        ensure((claude_dir / ".caveman-active").read_text(encoding="utf-8") == "caveman", "activation flag should default to caveman")
 
         # Test configurable default mode via CAVEMAN_DEFAULT_MODE env var
         activate_custom = run(
@@ -609,8 +758,8 @@ def verify_hook_install_flow() -> None:
         )
         ensure("CAVEMAN MODE ACTIVE" in activate_custom.stdout, "activation with custom default missing banner")
         ensure(
-            (claude_dir / ".caveman-active").read_text(encoding="utf-8") == "ultra",
-            "CAVEMAN_DEFAULT_MODE=ultra should set flag to ultra",
+            (claude_dir / ".caveman-active").read_text(encoding="utf-8") == "ultracave",
+            "CAVEMAN_DEFAULT_MODE=ultra (legacy) should set flag to ultracave",
         )
         # Test "off" mode — activation skipped, flag removed
         activate_off = run(
@@ -633,8 +782,8 @@ def verify_hook_install_flow() -> None:
         )
         ensure(not (claude_dir / ".caveman-active").exists(), "/caveman with off default should not write flag")
 
-        # Reset back to full for subsequent tests
-        (claude_dir / ".caveman-active").write_text("full", encoding="utf-8")
+        # Reset back to caveman for subsequent tests
+        (claude_dir / ".caveman-active").write_text("caveman", encoding="utf-8")
 
         run(
             ["node", "src/hooks/caveman-mode-tracker.js"],
@@ -648,15 +797,15 @@ def verify_hook_install_flow() -> None:
             env={**os.environ, **hook_env},
             text=True,
             encoding="utf-8",
-            input='{"prompt":"/caveman ultra"}',
+            input='{"prompt":"/ultracave"}',
             capture_output=True,
             check=True,
         )
         ensure(
-            "CAVEMAN MODE ACTIVE (ultra)" in ultra_prompt.stdout,
+            "CAVEMAN MODE ACTIVE (ultracave)" in ultra_prompt.stdout,
             "mode tracker should emit active-mode reinforcement",
         )
-        ensure((claude_dir / ".caveman-active").read_text(encoding="utf-8") == "ultra", "mode tracker did not record ultra")
+        ensure((claude_dir / ".caveman-active").read_text(encoding="utf-8") == "ultracave", "mode tracker did not record ultracave")
 
         subprocess.run(
             ["node", "src/hooks/caveman-mode-tracker.js"],
@@ -675,7 +824,7 @@ def verify_hook_install_flow() -> None:
             [bash, "src/hooks/caveman-statusline.sh"],
             env=hook_env,
         )
-        ensure("[CAVEMAN:WENYAN-ULTRA]" in statusline.stdout, "statusline badge output mismatch")
+        ensure("[MEGACAVE]" in statusline.stdout, "statusline badge output mismatch (legacy wenyan-ultra → megacave)")
 
         reinstall = run([bash, "src/hooks/install.sh"], env=hook_env)
         ensure("Nothing to do" in reinstall.stdout, "install.sh should be idempotent")
@@ -975,6 +1124,7 @@ def main() -> int:
         verify_manifests_and_syntax,
         verify_package_contents,
         verify_powershell_static,
+        verify_python_text_io_encoding,
         verify_compress_fixtures,
         verify_compress_cli,
         verify_hook_install_flow,
